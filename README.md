@@ -1,6 +1,6 @@
 # Nilvarcus Timestamp App
 
-[Image of App's Interface]
+![App Screenshot](app_screenshot.png)
 
 This is a simple application designed to assist with timestamping video recordings, particularly for content creators using software like OBS Studio. The primary function is to:
 
