@@ -233,6 +233,7 @@ class TimestampApp:
 
     def start_recording(self):
         """Start recording and print status."""
+        self.save_changes()
         if self.timestamp_manager.start_recording():
             self.update_text_viewer()
             print("Recording started.")
