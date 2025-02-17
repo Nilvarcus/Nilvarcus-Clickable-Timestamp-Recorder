@@ -15,7 +15,7 @@ This is a simple application designed to assist with timestamping video recordin
 * **Mark Time (F15):** Adds a timestamp to the TXT file.
 * **Stop Recording (F16):** Stops the stopwatch.
 * **Save Short (F18):** Saves a timestamp for a short clip or replay buffer.
-* **Save Changes (F17):** Manually saves changes to the TXT file (usually automatic).
+* **Voice Note (F17):** Take a Timestamp with a Voice Note Tag.
 
 **Usage Tips:**
 
