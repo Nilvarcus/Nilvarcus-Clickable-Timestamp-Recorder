@@ -68,9 +68,30 @@ class TimestampApp:
         self._create_text_viewer()
         self._create_filename_display()
         self._create_buttons()
+
+
+        # Start the autosave function
+        self.auto_save()
         
         # Start keyboard listener
         self._start_keyboard_listener()
+
+        # Bind the window closing event to run autosave one last time
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+
+    def on_closing(self):
+        # Run save_changes immediately before closing
+        self.save_changes()
+        print("Final autosave run before closing")
+        self.root.destroy()
+
+    def auto_save(self):
+        self.save_changes()  # Call the save_changes method
+        print("Auto-saved changes")  # Print to terminal
+        # Reschedule auto_save to run again in 15 seconds (15000 ms)
+        self.root.after(60000, self.auto_save)
+
 
     def _create_header(self):
         """Create a styled header with logo and title."""
@@ -178,7 +199,7 @@ class TimestampApp:
             ("Start Recording (F14)", self.start_recording, '#2ECC71', '#27AE60', 0, 1),
             ("Mark Time (F15)", self.mark_time, '#F39C12', '#D35400', 1, 0),
             ("Stop Recording (F16)", self.stop_recording, '#E74C3C', '#C0392B', 1, 1),
-            ("Save Changes (F17)", self.save_changes, '#9B59B6', '#8E44AD', 2, 1),
+            ("Voice Note (F17)", self.mark_voice_note, '#9B59B6', '#8E44AD', 2, 1),
             ("Save Short (F18)", self.save_short, '#1ABC9C', '#16A085', 2, 0)
         ]
 
@@ -216,8 +237,8 @@ class TimestampApp:
                 self.mark_time()
             elif key == keyboard.Key.f16:  # Stop recording
                 self.stop_recording()
-            elif key == keyboard.Key.f17:  # Save Changes
-                self.save_changes()
+            elif key == keyboard.Key.f17:  # Take a Voice Note
+                self.mark_voice_note()
             elif key == keyboard.Key.f18:  # Take a Short
                 self.save_short()
         except Exception as e:
@@ -268,38 +289,28 @@ class TimestampApp:
             print("Changes saved.")
 
     def update_text_viewer(self):
-        """Update the text viewer with color-coded file contents."""
-        text_content = self.timestamp_manager.read_file_content()
-        
-        # Clear existing content
-        self.text_viewer.delete("1.0", tk.END)
-        
-        # Configure tags for different colors
-        self.text_viewer.tag_configure("green", foreground="#00AA00")  # Green
-        self.text_viewer.tag_configure("purple", foreground="#AA00AA")  # Purple
-        self.text_viewer.tag_configure("red", foreground="#AA0000")  # Red
-
-        # Insert and tag lines
-        for line in text_content.split('\n'):
-            # Determine tag based on line content
-            tag = None
-            if "┌──" in line:
-                tag = "green"
-            elif "└──" in line and "SHORT-" not in line:
-                    tag = "red"
-            elif "SHORT-" in line:
-                tag = "purple"
-            elif "______________________________________________" in line:
-                tag = "red"
+            """Update the text viewer with file contents."""
+            text_content = self.timestamp_manager.read_file_content()
             
-            # Insert line with appropriate tag
-            if tag:
-                self.text_viewer.insert(tk.END, line + '\n', tag)
-            else:
+            # Clear existing content
+            self.text_viewer.delete("1.0", tk.END)
+            
+            # Insert lines without tags
+            for line in text_content.split('\n'):
                 self.text_viewer.insert(tk.END, line + '\n')
-        
-        # Scroll to the end
-        self.text_viewer.see(tk.END)
+            
+            # Scroll to the end
+            self.text_viewer.see(tk.END)
+
+
+    def mark_voice_note(self):
+        self.save_changes()
+        self.mark_time()
+        if self.timestamp_manager.mark_voice_note():
+            self.update_text_viewer()
+            print("Voice Note Taken")
+
+
 
 def main():
     """Main function to run the Timestamping App."""
