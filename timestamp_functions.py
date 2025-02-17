@@ -59,7 +59,7 @@ class TimestampManager:
             with open(self.current_file_path, "a", encoding="utf-8") as file:
                 timestamp = datetime.now().strftime("[%d-%m][%H-%M-%S]")
                 self.counter = 0  # Reset counter on start
-                file.write(f"\n┌── 0 - {timestamp}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                file.write(f"\n0 - {timestamp} -\n\n")
             self.start_time = time.time()
             self.stopwatch_running = True
             return True
@@ -77,7 +77,7 @@ class TimestampManager:
             formatted_time = time.strftime("[%H:%M:%S]", time.gmtime(elapsed_time))
             self.counter += 1  # Increment counter on each timestamp
             with open(self.current_file_path, "a", encoding="utf-8") as file:
-                file.write(f"\n└── {self.counter} - {formatted_time}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                file.write(f"\n{self.counter} - {formatted_time} -")
             return formatted_time
         return None
 
@@ -107,7 +107,7 @@ class TimestampManager:
         if self.current_file_path:
             with open(self.current_file_path, "a", encoding="utf-8") as file:
                 timestamp = datetime.now().strftime("[%d-%m][%H-%M-%S]")
-                file.write(f"\n└─────SHORT-{timestamp}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                file.write(f"\nSHORT-{timestamp} -\n\n")
             return True
         return False
 
@@ -141,3 +141,18 @@ class TimestampManager:
             except FileNotFoundError:
                 return ""
         return ""
+    
+
+
+    def mark_voice_note(self):
+        """
+        Mark 'VOICE NOTE' in the file.
+        
+        Returns:
+            bool: True if voice note marked successfully, False otherwise.
+        """
+        if self.current_file_path and self.stopwatch_running:
+            with open(self.current_file_path, "a", encoding="utf-8") as file:
+                file.write("*VOICE NOTE*")
+            return True
+        return False
