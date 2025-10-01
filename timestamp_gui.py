@@ -4,6 +4,7 @@ from pynput import keyboard
 from threading import Thread
 
 # Import the TimestampManager from the local module
+# Make sure you have the timestamp_functions.py file in the same directory
 from timestamp_functions import TimestampManager, os
 
 class StyledButton(tk.Button):
@@ -94,24 +95,9 @@ class TimestampApp:
 
 
     def _create_header(self):
-        """Create a styled header with logo and title."""
-        header_frame = tk.Frame(self.root, bg='#FFFFFF', padx=20, pady=15)
+        """Create a styled header where the title fills the entire area."""
+        header_frame = tk.Frame(self.root, bg='#FFFFFF')
         header_frame.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 0))
-        
-        # Load your custom logo image
-        logo_image = tk.PhotoImage(file="logo.png")  # Replace "your_logo.png" with your actual image path
-
-        # Resize the image (adjust width and height as needed)
-        resized_logo = logo_image.subsample(80, 80)  # This halves the image size in both dimensions
-        
-        # Display the logo image
-        logo_label = tk.Label(
-            header_frame,
-            image=resized_logo,
-            bg='#FFFFFF'
-        )
-        logo_label.image = resized_logo  # Keep a reference to prevent garbage collection
-        logo_label.pack(side=tk.LEFT, anchor=tk.NE)
         
         # Title
         title_font = font.Font(family='Segoe UI', size=16, weight='bold')
@@ -120,20 +106,11 @@ class TimestampApp:
             text="Nilvarcus Timestamp App", 
             font=title_font, 
             bg='#FFFFFF', 
-            fg='#2C3E50'
+            fg='#2C3E50',
+            pady=15  # Add vertical padding to give the header height
         )
-        title_label.pack(fill=tk.X, anchor=tk.CENTER) #Center the Title
-
-        def check_window_width():
-            if self.root.winfo_width() < 435:  # Adjust this threshold as needed
-                title_label.pack_forget()
-            else:
-                title_label.pack(fill=tk.X, anchor=tk.CENTER)
-        # Bind the check function to window resize events
-        self.root.bind("<Configure>", lambda event: check_window_width())
-
-        # Initial check to hide the title if the window is too small initially
-        check_window_width()
+        # Pack the title to expand and fill the entire header frame
+        title_label.pack(fill=tk.BOTH, expand=True)
 
     def _create_text_viewer(self):
         """Create the scrolled text viewer with improved styling."""
@@ -195,7 +172,7 @@ class TimestampApp:
         button_frame.columnconfigure(1, weight=1)
 
         buttons = [
-            ("Create File (F13)", self.create_file, '#3498DB', '#2980B9', 0, 0),
+            ("Create / Open File (F13)", self.create_file, '#3498DB', '#2980B9', 0, 0),
             ("Start Recording (F14)", self.start_recording, '#2ECC71', '#27AE60', 0, 1),
             ("Mark Time (F15)", self.mark_time, '#F39C12', '#D35400', 1, 0),
             ("Stop Recording (F16)", self.stop_recording, '#E74C3C', '#C0392B', 1, 1),
