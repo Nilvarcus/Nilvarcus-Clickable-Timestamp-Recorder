@@ -1,10 +1,11 @@
 import tkinter as tk
-from tkinter import scrolledtext, font, Toplevel, messagebox
+from tkinter import font, messagebox
 from pynput import keyboard
 from threading import Thread
 import json
 import os
 import sys
+import customtkinter as ctk
 
 # Import the TimestampManager from the local module
 from timestamp_functions import TimestampManager
@@ -12,146 +13,161 @@ from timestamp_functions import TimestampManager
 def get_base_path() -> str:
     """Gets the base path for the application, whether running as a script or a frozen exe."""
     if getattr(sys, 'frozen', False):
-        # If the application is run as a bundle, the base path is the executable's directory
         return os.path.dirname(sys.executable)
     else:
-        # If the application is run as a script, the base path is the script's directory
         return os.path.dirname(os.path.abspath(__file__))
 
 class Theme:
     """A centralized class for managing the application's visual theme."""
-    COLOR_BACKGROUND = '#F0F4F8'
-    COLOR_FRAME = '#FFFFFF'
-    COLOR_TEXT_PRIMARY = '#2C3E50'
-    COLOR_TEXT_SECONDARY = '#5D6D7E'
-    COLOR_BORDER = '#D6DBDF'
+    # CustomTkinter handles main background/text colors in dark mode automatically,
+    # but we still want our specific accent colors for buttons and states.
+    BLUE = '#3498DB'
+    HOVER_BLUE = '#2980B9'
+    GREEN = '#2ECC71'
+    HOVER_GREEN = '#27AE60'
+    ORANGE = '#F39C12'
+    HOVER_ORANGE = '#D35400'
+    RED = '#E74C3C'
+    HOVER_RED = '#C0392B'
+    PURPLE = '#9B59B6'
+    HOVER_PURPLE = '#8E44AD'
+    TURQUOISE = '#1ABC9C'
+    HOVER_TURQUOISE = '#16A085'
+    GREY = '#95A5A6'
+    HOVER_GREY = '#7F8C8D'
 
-    # Button Colors
-    BLUE = ('#3498DB', '#2980B9')
-    GREEN = ('#2ECC71', '#27AE60')
-    ORANGE = ('#F39C12', '#D35400')
-    RED = ('#E74C3C', '#C0392B')
-    PURPLE = ('#9B59B6', '#8E44AD')
-    TURQUOISE = ('#1ABC9C', '#16A085')
-    GREY = ('#95A5A6', '#7F8C8D')
-
-    # Fonts
     FONT_FAMILY = "Segoe UI"
     FONT_TITLE = (FONT_FAMILY, 16, "bold")
     FONT_SUBTITLE = (FONT_FAMILY, 11, "bold")
-    FONT_BODY = (FONT_FAMILY, 10)
-    FONT_BUTTON = (FONT_FAMILY, 10, "bold")
-    FONT_TEXT_AREA = ("Consolas", 11)
+    FONT_BODY = (FONT_FAMILY, 12)
+    FONT_BUTTON = (FONT_FAMILY, 12, "bold")
+    FONT_TEXT_AREA = ("Consolas", 12)
 
-
-class StyledButton(tk.Button):
-    """A custom button with enhanced styling and hover effects."""
-    def __init__(self, master, bg_color, hover_color, **kwargs):
-        super().__init__(master, **kwargs)
+class RecordingWidget(ctk.CTkToplevel):
+    """A floating mini-widget to show recording time and statuses."""
+    def __init__(self, parent):
+        super().__init__(parent.root)
+        self.parent = parent
+        self.title("Recording")
+        self.attributes('-topmost', True) # Keep window on top
         
-        self.bg_color = bg_color
-        self.hover_color = hover_color
+        # Make the window somewhat compact
+        self.geometry("200x80")
+        self.minsize(150, 60)
+        self.resizable(False, False)
         
-        self.configure(
-            font=Theme.FONT_BUTTON,
-            bg=self.bg_color,
-            fg='white',
-            activebackground=self.hover_color,
-            activeforeground='white',
-            relief=tk.FLAT,
-            borderwidth=0,
-            pady=8,
-            cursor="hand2",
-            highlightthickness=2,
-            highlightbackground=self.bg_color
-        )
+        self.create_widgets()
+        self.update_timer()
         
-        self.bind('<Enter>', self._on_enter)
-        self.bind('<Leave>', self._on_leave)
+        # Position near the top right of the main window or screen
+        x = parent.root.winfo_x() + parent.root.winfo_width() + 10
+        y = parent.root.winfo_y()
+        self.geometry(f'+{x}+{y}')
+        
+        self.protocol("WM_DELETE_WINDOW", self.hide_widget)
+        
+    def create_widgets(self):
+        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+        
+        self.time_label = ctk.CTkLabel(main_frame, text="00:00:00", font=Theme.FONT_TITLE)
+        self.time_label.pack(side=tk.TOP, expand=True)
 
-    def _on_enter(self, e):
-        self.configure(bg=self.hover_color, highlightbackground=self.hover_color)
+        self.status_label = ctk.CTkLabel(main_frame, text="", font=Theme.FONT_BODY, text_color=Theme.RED)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def _on_leave(self, e):
-        self.configure(bg=self.bg_color, highlightbackground=self.bg_color)
+    def update_timer(self):
+        if self.parent.timestamp_manager.stopwatch_running:
+            elapsed_str = self.parent.timestamp_manager.get_elapsed_time()
+            if elapsed_str:
+                self.time_label.configure(text=elapsed_str)
+            self.after(500, self.update_timer)
 
+    def show_status(self, message, duration=3000, color=Theme.GREEN):
+        self.status_label.configure(text=message, text_color=color)
+        
+        if hasattr(self, '_hide_status_job') and self._hide_status_job:
+            self.after_cancel(self._hide_status_job)
+            
+        self._hide_status_job = self.after(duration, lambda: self.status_label.configure(text=""))
+        
+    def hide_widget(self):
+        self.withdraw()
 
-class SettingsWindow(Toplevel):
+class SettingsWindow(ctk.CTkToplevel):
     """A Toplevel window for changing keybinds, styled and auto-sized."""
     def __init__(self, parent):
         super().__init__(parent.root)
         self.parent = parent
         self.title("Keybind Settings")
-        # self.geometry("450x400") # <-- REMOVE THIS LINE
-        self.configure(bg=Theme.COLOR_BACKGROUND)
         self.transient(parent.root)
         self.grab_set()
 
         self.new_keybinds = parent.keybinds.copy()
+        self.new_custom_texts = parent.custom_texts.copy()
         self.bind_buttons = {}
+        self.text_entries = {}
 
         self.create_widgets()
 
-        # --- NEW: Auto-sizing and Centering Logic ---
-        # 1. Force the window to calculate the size it needs for all its widgets
         self.update_idletasks()
+        width = self.winfo_reqwidth() + 60
+        height = self.winfo_reqheight() + 40
 
-        # 2. Get the calculated required size
-        width = self.winfo_reqwidth()
-        height = self.winfo_reqheight()
-
-        # 3. Get the main window's position and size
         parent_x = self.parent.root.winfo_x()
         parent_y = self.parent.root.winfo_y()
         parent_width = self.parent.root.winfo_width()
         parent_height = self.parent.root.winfo_height()
 
-        # 4. Calculate the position to center the settings window over the main window
         x = parent_x + (parent_width // 2) - (width // 2)
         y = parent_y + (parent_height // 2) - (height // 2)
         
-        # 5. Set the window's minimum size to what we calculated, and set its position
         self.minsize(width, height)
         self.geometry(f'+{x}+{y}')
 
-
     def create_widgets(self):
-        main_frame = tk.Frame(self, bg=Theme.COLOR_BACKGROUND, padx=20, pady=20)
-        main_frame.pack(expand=True, fill=tk.BOTH)
+        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame.pack(expand=True, fill=tk.BOTH, padx=20, pady=20)
 
-        title_label = tk.Label(main_frame, text="Change Keybinds", font=Theme.FONT_TITLE, bg=Theme.COLOR_BACKGROUND, fg=Theme.COLOR_TEXT_PRIMARY)
+        title_label = ctk.CTkLabel(main_frame, text="Change Keybinds", font=Theme.FONT_TITLE)
         title_label.pack(pady=(0, 20))
 
         for action_id, label_text in self.parent.action_labels.items():
-            frame = tk.Frame(main_frame, bg=Theme.COLOR_FRAME, pady=8)
+            frame = ctk.CTkFrame(main_frame)
             frame.pack(fill=tk.X, pady=4)
             
-            label = tk.Label(frame, text=f"{label_text}:", font=Theme.FONT_BODY, bg=Theme.COLOR_FRAME, fg=Theme.COLOR_TEXT_SECONDARY, anchor='w')
-            label.pack(side=tk.LEFT, padx=(15, 0))
+            label = ctk.CTkLabel(frame, text=f"{label_text}:", font=Theme.FONT_BODY, anchor='w')
+            label.pack(side=tk.LEFT, padx=(15, 0), pady=8)
 
             key_str = self.new_keybinds.get(action_id, "N/A").upper()
-            btn = tk.Button(
-                frame, text=key_str, font=Theme.FONT_BODY, width=15, 
-                relief=tk.FLAT, bg='#ECF0F1', fg=Theme.COLOR_TEXT_PRIMARY,
+            btn = ctk.CTkButton(
+                frame, text=key_str, font=Theme.FONT_BODY, width=100, 
                 command=lambda aid=action_id: self.change_key(aid)
             )
-            btn.pack(side=tk.RIGHT, padx=(0, 15))
+            btn.pack(side=tk.RIGHT, padx=(15, 15), pady=8)
             self.bind_buttons[action_id] = btn
 
-        button_frame = tk.Frame(main_frame, bg=Theme.COLOR_BACKGROUND, pady=15)
-        button_frame.pack(fill=tk.X, side=tk.BOTTOM)
+            # If this is a custom note, add a text entry field
+            if action_id.startswith("custom_note_"):
+                entry = ctk.CTkEntry(frame, placeholder_text="Enter note text...", width=150, font=Theme.FONT_BODY)
+                entry.insert(0, self.new_custom_texts.get(action_id, ""))
+                entry.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(15, 0), pady=8)
+                self.text_entries[action_id] = entry
+
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(15, 0))
         button_frame.columnconfigure((0, 1), weight=1)
 
-        save_btn = StyledButton(button_frame, text="Save", command=self.save_and_close, bg_color=Theme.GREEN[0], hover_color=Theme.GREEN[1])
+        save_btn = ctk.CTkButton(button_frame, text="Save", command=self.save_and_close, fg_color=Theme.GREEN, hover_color=Theme.HOVER_GREEN, font=Theme.FONT_BUTTON)
         save_btn.grid(row=0, column=0, padx=5, sticky='ew')
         
-        cancel_btn = StyledButton(button_frame, text="Cancel", command=self.destroy, bg_color=Theme.RED[0], hover_color=Theme.RED[1])
+        cancel_btn = ctk.CTkButton(button_frame, text="Cancel", command=self.destroy, fg_color=Theme.RED, hover_color=Theme.HOVER_RED, font=Theme.FONT_BUTTON)
         cancel_btn.grid(row=0, column=1, padx=5, sticky='ew')
 
     def change_key(self, action_id: str):
         button = self.bind_buttons[action_id]
         original_text = button.cget('text')
-        button.config(text="Press a key...", state=tk.DISABLED)
+        button.configure(text="Press a key...", state="disabled")
 
         def on_press_capture(key):
             new_key_str = self.parent.get_key_str(key)
@@ -159,18 +175,23 @@ class SettingsWindow(Toplevel):
             for aid, bound_key in self.new_keybinds.items():
                 if bound_key == new_key_str and aid != action_id:
                     messagebox.showerror("Error", f"Key '{new_key_str.upper()}' is already bound.", parent=self)
-                    button.config(text=original_text, state=tk.NORMAL)
+                    button.configure(text=original_text, state="normal")
                     return False
 
             self.new_keybinds[action_id] = new_key_str
-            button.config(text=new_key_str.upper(), state=tk.NORMAL)
+            button.configure(text=new_key_str.upper(), state="normal")
             return False
 
         listener = keyboard.Listener(on_press=on_press_capture)
         listener.start()
 
     def save_and_close(self):
+        # Save custom texts from entries
+        for action_id, entry in self.text_entries.items():
+            self.new_custom_texts[action_id] = entry.get()
+            
         self.parent.keybinds = self.new_keybinds
+        self.parent.custom_texts = self.new_custom_texts
         self.parent.save_keybinds()
         self.parent.update_button_text()
         self.destroy()
@@ -181,35 +202,48 @@ class TimestampApp:
         self.root.title("Nilvarcus Timestamp App")
         self.root.geometry("450x650")
         self.root.minsize(450, 500)
-        self.root.configure(bg=Theme.COLOR_BACKGROUND)
+        self.root.resizable(True, True)
         
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
-        self.timestamp_manager = TimestampManager()
+        self.timestamp_manager = TimestampManager(base_path=get_base_path())
         self.keybinds_file = os.path.join(get_base_path(), 'keybinds.json')
         self.buttons = {}
+        self.mini_widget = None
         
         self.action_labels = {
             'create_file': "Create / Open File", 'start_recording': "Start Recording",
             'mark_time': "Mark Time", 'stop_recording': "Stop Recording",
             'save_short': "Save Short", 'mark_voice_note': "Voice Note",
+            'custom_note_1': "Custom Note 1", 'custom_note_2': "Custom Note 2",
+            'custom_note_3': "Custom Note 3", 'custom_note_4': "Custom Note 4",
+            'custom_note_5': "Custom Note 5",
         }
         self.default_keybinds = {
             'create_file': 'f13', 'start_recording': 'f14', 'mark_time': 'f15',
             'stop_recording': 'f16', 'save_short': 'f18', 'mark_voice_note': 'f17',
+            'custom_note_1': 'f20', 'custom_note_2': 'f21', 'custom_note_3': 'f22',
+            'custom_note_4': 'f23', 'custom_note_5': 'f24',
         }
+        self.default_texts = {
+            'custom_note_1': 'Note 1', 'custom_note_2': 'Note 2',
+            'custom_note_3': 'Note 3', 'custom_note_4': 'Note 4',
+            'custom_note_5': 'Note 5',
+        }
+        self.custom_texts = {}
         self.load_keybinds()
 
         self._create_widgets()
         self.update_button_text()
+        
+        self.timestamp_manager.register_gui_callback(self.on_transcription_status)
 
         self.auto_save()
         self._start_keyboard_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _create_widgets(self):
-        """Single method to create all GUI elements."""
         self._create_header()
         self._create_text_viewer()
         self._create_filename_display()
@@ -218,17 +252,36 @@ class TimestampApp:
     def load_keybinds(self):
         try:
             with open(self.keybinds_file, 'r') as f:
-                self.keybinds = json.load(f)
+                data = json.load(f)
+                
+            # Handle legacy format where it was just the keybinds dictionary directly
+            if 'keybinds' in data:
+                self.keybinds = data.get('keybinds', {})
+                self.custom_texts = data.get('custom_texts', {})
+            else:
+                self.keybinds = data
+                self.custom_texts = {}
+                
             for action in self.default_keybinds:
                 if action not in self.keybinds:
                     self.keybinds[action] = self.default_keybinds[action]
+            for action in self.default_texts:
+                if action not in self.custom_texts:
+                    self.custom_texts[action] = self.default_texts[action]
+                    
         except (FileNotFoundError, json.JSONDecodeError):
             self.keybinds = self.default_keybinds.copy()
+            self.custom_texts = self.default_texts.copy()
+        
         self.save_keybinds()
 
     def save_keybinds(self):
         with open(self.keybinds_file, 'w') as f:
-            json.dump(self.keybinds, f, indent=4)
+            data = {
+                'keybinds': self.keybinds,
+                'custom_texts': self.custom_texts
+            }
+            json.dump(data, f, indent=4)
 
     def on_closing(self):
         self.save_changes()
@@ -241,66 +294,63 @@ class TimestampApp:
         self.root.after(60000, self.auto_save)
 
     def _create_header(self):
-        header_container = tk.Frame(self.root, bg=Theme.COLOR_FRAME)
+        header_container = ctk.CTkFrame(self.root)
         header_container.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 0))
         
-        title_label = tk.Label(header_container, text="Nilvarcus Timestamp App", font=Theme.FONT_TITLE, bg=Theme.COLOR_FRAME, fg=Theme.COLOR_TEXT_PRIMARY, pady=15)
-        title_label.pack(fill=tk.X, expand=True)
-
-        # Bottom border for separation
-        separator = tk.Frame(header_container, height=1, bg=Theme.COLOR_BORDER)
-        separator.pack(fill=tk.X)
+        title_label = ctk.CTkLabel(header_container, text="Nilvarcus Timestamp App", font=Theme.FONT_TITLE)
+        title_label.pack(fill=tk.X, expand=True, pady=15)
 
     def _create_text_viewer(self):
-        text_frame = tk.Frame(self.root, bg=Theme.COLOR_FRAME, bd=1, relief=tk.SOLID, highlightbackground=Theme.COLOR_BORDER, highlightthickness=1)
+        text_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         text_frame.grid(row=1, column=0, padx=10, pady=10, sticky='nsew')
         
-        self.text_viewer = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, font=Theme.FONT_TEXT_AREA, bg=Theme.COLOR_FRAME, fg=Theme.COLOR_TEXT_PRIMARY, borderwidth=0, relief=tk.FLAT, padx=10, pady=10)
+        self.text_viewer = ctk.CTkTextbox(text_frame, wrap=tk.WORD, font=Theme.FONT_TEXT_AREA)
+        # Using pack so it expands naturally
         self.text_viewer.pack(expand=True, fill=tk.BOTH)
 
     def _create_filename_display(self):
-        filename_frame = tk.Frame(self.root, bg=Theme.COLOR_BACKGROUND)
+        filename_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         filename_frame.grid(row=2, column=0, padx=10, pady=(0, 5), sticky='ew')
 
-        label = tk.Label(filename_frame, text="Current File:", font=Theme.FONT_SUBTITLE, bg=Theme.COLOR_BACKGROUND, fg=Theme.COLOR_TEXT_PRIMARY)
+        label = ctk.CTkLabel(filename_frame, text="Current File:", font=Theme.FONT_SUBTITLE)
         label.pack(side=tk.LEFT, padx=(5, 10))
         
-        self.filename_label = tk.Label(filename_frame, text="No file open", font=Theme.FONT_BODY, bg=Theme.COLOR_BACKGROUND, fg=Theme.COLOR_TEXT_SECONDARY, anchor="w")
+        self.filename_label = ctk.CTkLabel(filename_frame, text="No file open", font=Theme.FONT_BODY, anchor="w")
         self.filename_label.pack(side=tk.LEFT, expand=True, fill=tk.X)
 
     def _update_filename_display(self):
         if self.timestamp_manager.current_file_path:
-            self.filename_label.config(text=os.path.basename(self.timestamp_manager.current_file_path))
+            self.filename_label.configure(text=os.path.basename(self.timestamp_manager.current_file_path))
         else:
-            self.filename_label.config(text="No file open")
+            self.filename_label.configure(text="No file open")
 
     def _create_buttons(self):
-        button_frame = tk.Frame(self.root, bg=Theme.COLOR_BACKGROUND)
-        button_frame.grid(row=3, column=0, padx=10, pady=10, sticky='ew')
+        button_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        button_frame.grid(row=3, column=0, padx=10, pady=(0, 10), sticky='ew')
         button_frame.columnconfigure((0, 1), weight=1)
 
         button_config = {
-            'create_file': (self.create_file, Theme.BLUE, 0, 0),
-            'start_recording': (self.start_recording, Theme.GREEN, 0, 1),
-            'mark_time': (self.mark_time, Theme.ORANGE, 1, 0),
-            'stop_recording': (self.stop_recording, Theme.RED, 1, 1),
-            'save_short': (self.save_short, Theme.TURQUOISE, 2, 0),
-            'mark_voice_note': (self.mark_voice_note, Theme.PURPLE, 2, 1),
+            'create_file': (self.create_file, Theme.BLUE, Theme.HOVER_BLUE, 0, 0),
+            'start_recording': (self.start_recording, Theme.GREEN, Theme.HOVER_GREEN, 0, 1),
+            'mark_time': (self.mark_time, Theme.ORANGE, Theme.HOVER_ORANGE, 1, 0),
+            'stop_recording': (self.stop_recording, Theme.RED, Theme.HOVER_RED, 1, 1),
+            'save_short': (self.save_short, Theme.TURQUOISE, Theme.HOVER_TURQUOISE, 2, 0),
+            'mark_voice_note': (self.mark_voice_note, Theme.PURPLE, Theme.HOVER_PURPLE, 2, 1),
         }
 
-        for action_id, (command, (bg, hover), row, col) in button_config.items():
-            btn = StyledButton(button_frame, command=command, bg_color=bg, hover_color=hover)
-            btn.grid(row=row, column=col, padx=5, pady=4, sticky='ew')
+        for action_id, (command, bg, hover, row, col) in button_config.items():
+            btn = ctk.CTkButton(button_frame, command=command, fg_color=bg, hover_color=hover, font=Theme.FONT_BUTTON)
+            btn.grid(row=row, column=col, padx=4, pady=4, sticky='ew')
             self.buttons[action_id] = btn
         
-        settings_btn = StyledButton(button_frame, text="Settings", command=self.open_settings_window, bg_color=Theme.GREY[0], hover_color=Theme.GREY[1])
-        settings_btn.grid(row=3, column=0, columnspan=2, padx=5, pady=4, sticky='ew')
+        settings_btn = ctk.CTkButton(button_frame, text="Settings", command=self.open_settings_window, fg_color=Theme.GREY, hover_color=Theme.HOVER_GREY, font=Theme.FONT_BUTTON)
+        settings_btn.grid(row=3, column=0, columnspan=2, padx=4, pady=4, sticky='ew')
 
     def update_button_text(self):
         for action_id, button in self.buttons.items():
             key_name = self.keybinds.get(action_id, 'N/A').upper()
             label_text = self.action_labels.get(action_id, 'Unknown')
-            button.config(text=f"{label_text} ({key_name})")
+            button.configure(text=f"{label_text} ({key_name})")
 
     def open_settings_window(self):
         SettingsWindow(self)
@@ -315,6 +365,11 @@ class TimestampApp:
             'create_file': self.create_file, 'start_recording': self.start_recording,
             'mark_time': self.mark_time, 'stop_recording': self.stop_recording,
             'save_short': self.save_short, 'mark_voice_note': self.mark_voice_note,
+            'custom_note_1': lambda: self.mark_custom_note_n('custom_note_1'),
+            'custom_note_2': lambda: self.mark_custom_note_n('custom_note_2'),
+            'custom_note_3': lambda: self.mark_custom_note_n('custom_note_3'),
+            'custom_note_4': lambda: self.mark_custom_note_n('custom_note_4'),
+            'custom_note_5': lambda: self.mark_custom_note_n('custom_note_5'),
         }
         Thread(target=lambda: keyboard.Listener(on_press=self._on_press).start(), daemon=True).start()
 
@@ -324,36 +379,84 @@ class TimestampApp:
         action_id = key_to_action.get(key_str)
         if action_id in self.action_map:
             try:
-                # Schedule GUI updates to be run in the main thread
                 self.root.after(0, self.action_map[action_id])
             except Exception as e:
                 print(f"Error executing action '{action_id}': {e}")
 
-    # --- Action Methods (wrapped to ensure GUI updates happen in main thread) ---
     def create_file(self):
         file_path = self.timestamp_manager.create_file()
         if file_path: self.update_text_viewer(); self._update_filename_display()
 
     def start_recording(self):
         self.save_changes()
-        if self.timestamp_manager.start_recording(): self.update_text_viewer()
+        if self.timestamp_manager.start_recording():
+            self.update_text_viewer()
+            if self.mini_widget is None or not self.mini_widget.winfo_exists():
+                self.mini_widget = RecordingWidget(self)
+            else:
+                self.mini_widget.deiconify()
+                self.mini_widget.update_timer()
 
     def mark_time(self):
         self.save_changes()
-        if self.timestamp_manager.mark_time(): self.update_text_viewer()
+        if self.timestamp_manager.mark_time():
+            self.update_text_viewer()
+            if self.mini_widget and self.mini_widget.winfo_exists():
+                self.mini_widget.show_status("Timestamp Marked!", color=Theme.BLUE)
 
     def stop_recording(self):
         self.save_changes()
-        if self.timestamp_manager.stop_recording(): self.update_text_viewer()
+        if self.timestamp_manager.stop_recording():
+            self.update_text_viewer()
+            if self.mini_widget and self.mini_widget.winfo_exists():
+                self.mini_widget.destroy()
+                self.mini_widget = None
 
     def save_short(self):
         self.save_changes()
-        if self.timestamp_manager.save_short(): self.update_text_viewer()
+        if self.timestamp_manager.save_short():
+            self.update_text_viewer()
+            if self.mini_widget and self.mini_widget.winfo_exists():
+                self.mini_widget.show_status("Short Saved!", color=Theme.TURQUOISE)
 
     def mark_voice_note(self):
         self.save_changes()
         self.mark_time()
-        if self.timestamp_manager.mark_voice_note(): self.update_text_viewer()
+        if self.timestamp_manager.mark_voice_note():
+            pass
+
+    def mark_custom_note_n(self, action_id):
+        self.save_changes()
+        custom_text = self.custom_texts.get(action_id, "")
+        if self.timestamp_manager.mark_custom_note(custom_text):
+            self.update_text_viewer()
+            if self.mini_widget and self.mini_widget.winfo_exists():
+                self.mini_widget.show_status(f"Added: {custom_text}", color=Theme.BLUE)
+
+    def on_transcription_status(self, status):
+        def update_gui():
+            if status.startswith("COMPLETE|"):
+                transcription = status.split("|", 1)[1]
+                if transcription:
+                    self.text_viewer.insert(tk.END, f" *VOICE NOTE: {transcription}*\n")
+                self.save_changes()
+                
+                key_name = self.keybinds.get('mark_voice_note', 'N/A').upper()
+                label_text = self.action_labels.get('mark_voice_note', 'Unknown')
+                if 'mark_voice_note' in self.buttons:
+                    self.buttons['mark_voice_note'].configure(text=f"{label_text} ({key_name})")
+                self.text_viewer.see(tk.END)
+                
+                if self.mini_widget and self.mini_widget.winfo_exists():
+                    self.mini_widget.show_status("Transcribed!", duration=4000, color=Theme.GREEN)
+            else:
+                if 'mark_voice_note' in self.buttons:
+                    self.buttons['mark_voice_note'].configure(text=status)
+                
+                if self.mini_widget and self.mini_widget.winfo_exists():
+                    self.mini_widget.show_status(status, duration=10000, color=Theme.PURPLE)
+                    
+        self.root.after(0, update_gui)
             
     def save_changes(self):
         if self.timestamp_manager.current_file_path:
@@ -366,7 +469,9 @@ class TimestampApp:
         self.text_viewer.see(tk.END)
 
 def main():
-    root = tk.Tk()
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     app = TimestampApp(root)
     root.mainloop()
 
