@@ -8,14 +8,24 @@ This is a simple application designed to assist with timestamping video recordin
 2. **Mark Timestamps:** You can manually mark specific points in time during the recording.
 3. **Generate Timestamp File:** These timestamps are saved to a TXT file, making it easy to reference later.
 
-**Features and Keybinds:**
+**Core Features:**
+
+* **Timestamp Consolidation:** Automatically saves all timestamp files to a dedicated `Timestamp_TXT` folder.
+* **Modern Dark UI:** Fully modernized GUI built with CustomTkinter.
+* **Always-on-Top Recording Widget:** A floating mini-widget displays the recording timer and temporary status confirmations (e.g. "Timestamp marked!").
+* **Total Recording Time Tracking:** Appends the total elapsed time securely to the file whenever you stop recording, acting as a final duration log before the separator.
+* **Speech-to-Text Voice Notes:** Captures 10 seconds of mic audio, transcribes it via OpenAI Whisper in the background, and appends the text directly to your timestamps.
+* **Custom Multi-Hotkeys:** 5 configurable hotkeys to instantly inject custom predefined text phrases (e.g., "Funny moment") into the running timeline. Configurable from the Settings GUI.
+
+**Default Keybinds:**
 
 * **Create File (F13):** Creates a new TXT file or opens an existing one.
 * **Start Recording (F14):** Starts the stopwatch and begins timestamping the recording file.
 * **Mark Time (F15):** Adds a timestamp to the TXT file.
 * **Stop Recording (F16):** Stops the stopwatch.
+* **Voice Note (F17):** Record a 10s audio clip that is transcribed and appended to the timestamp.
 * **Save Short (F18):** Saves a timestamp for a short clip or replay buffer.
-* **Voice Note (F17):** Take a Timestamp with a Voice Note Tag.
+* **Custom Notes (F20-F24):** Instantly inject custom pre-configured text notes into the file.
 
 **Usage Tips:**
 
