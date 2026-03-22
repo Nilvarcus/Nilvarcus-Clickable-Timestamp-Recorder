@@ -2,37 +2,57 @@
 
 ![App Screenshot](app_screenshot-2.0.png)
 
-This is a simple application designed to assist with timestamping video recordings, particularly for content creators using software like OBS Studio. The primary function is to:
+A professional, streamlined Python application designed for content creators (e.g., OBS Studio, Replay Buffer users) to efficiently mark and manage timestamps during video recordings. Featuring a modern dark UI, global hotkey support, and AI-powered voice transcription.
 
-1. **Track Recording Time:** A stopwatch is initiated when you start your recording session.
-2. **Mark Timestamps:** You can manually mark specific points in time during the recording.
-3. **Generate Timestamp File:** These timestamps are saved to a TXT file, making it easy to reference later.
+## 🚀 Key Features
 
-**Core Features:**
+*   **Modern Dark UI:** A sleek, high-contrast interface built with `CustomTkinter` for a professional look.
+*   **AI Voice Transcription:** Integrated `OpenAI Whisper` support. Record 10-second voice notes that are transcribed in the background and appended directly to your log.
+*   **Floating Status Widget:** An "Always-on-Top" mini-timer that displays recording status and confirms actions (e.g., "Timestamp Marked!") without obstructing your workspace.
+*   **Global Hotkeys:** Full support for `F13-F24` keys, allowing seamless integration with Stream Decks, AutoHotkey, or specialized macros.
+*   **Dynamic Custom Notes:** 5 configurable hotkeys to instantly inject pre-defined phrases (e.g., "Funny Moment", "Death", "Epic Play") into your timeline.
+*   **Advanced Markdown Formatting:** Generates clean, bolded, and highly readable `.md` files:
+    *   **Bolded Counters:** `**[1]**`
+    *   **Bolded Timestamps:** `**[00:00:00]**`
+    *   **Clean Separation:** Automatic newlines for Starting Notes, Ending Notes, and SHORTS.
+*   **Autosave & Persistence:** Background autosaving ensures you never lose a mark, even if the app closes unexpectedly.
 
-* **Timestamp Consolidation:** Automatically saves all timestamp files to a dedicated `Timestamp_TXT` folder.
-* **Modern Dark UI:** Fully modernized GUI built with CustomTkinter.
-* **Always-on-Top Recording Widget:** A floating mini-widget displays the recording timer and temporary status confirmations (e.g. "Timestamp marked!").
-* **Total Recording Time Tracking:** Appends the total elapsed time securely to the file whenever you stop recording, acting as a final duration log before the separator.
-* **Speech-to-Text Voice Notes:** Captures 10 seconds of mic audio, transcribes it via OpenAI Whisper in the background, and appends the text directly to your timestamps.
-* **Custom Multi-Hotkeys:** 5 configurable hotkeys to instantly inject custom predefined text phrases (e.g., "Funny moment") into the running timeline. Configurable from the Settings GUI.
+## ⌨️ Default Keybinds
 
-**Default Keybinds:**
+| Action | Key | Description |
+| :--- | :--- | :--- |
+| **Create/Open File** | `F13` | Initialize a new session file in the `Timestamp_TXT` folder. |
+| **Start Recording** | `F14` | Synchronize the stopwatch with your recording start. |
+| **Mark Time** | `F15` | Instantly drop a bolded timestamp mark. |
+| **Stop Recording** | `F16` | Finalize the log with total duration and a separator. |
+| **Voice Note** | `F17` | Record 10s of audio for AI transcription. |
+| **Save Short** | `F18` | Create a separated header for a Short or Replay Buffer clip. |
+| **Custom Notes** | `F20-F24`| Inject your 5 pre-configured text notes. |
 
-* **Create File (F13):** Creates a new TXT file or opens an existing one.
-* **Start Recording (F14):** Starts the stopwatch and begins timestamping the recording file.
-* **Mark Time (F15):** Adds a timestamp to the TXT file.
-* **Stop Recording (F16):** Stops the stopwatch.
-* **Voice Note (F17):** Record a 10s audio clip that is transcribed and appended to the timestamp.
-* **Save Short (F18):** Saves a timestamp for a short clip or replay buffer.
-* **Custom Notes (F20-F24):** Instantly inject custom pre-configured text notes into the file.
+## 🛠️ Installation & Setup
 
-**Usage Tips:**
+### Prerequisites
+- **Python 3.x**
+- **FFmpeg** (Required for OpenAI Whisper audio processing)
 
-- **Keybind Software:** You'll need software like AutoHotkey or a Stream Deck to assign these keybinds and integrate them with OBS Studio.
-- **OBS Studio Settings:** Configure OBS to use a specific naming format for your recordings, such as `[%DD-%MM][%hh-%mm-%ss]`. This will ensure consistent naming with your timestamp file.
-- **Hybrid MP4 Recording:** Consider using the "Hybrid MP4" recording format in OBS. This allows you to add chapter markers based on the timestamps in your TXT file. When imported into video editing software like DaVinci Resolve, these markers will align with the corresponding timestamps.
+### Dependencies
+```bash
+pip install customtkinter pynput openai-whisper sounddevice numpy
+```
 
-**Disclaimer:**
+### Running the App
+```bash
+python timestamp_gui.py
+```
 
-This application is a personal project and may not be fully polished or feature-rich. It's designed to meet my specific needs and may not be suitable for everyone. Feel free to experiment and customize it to your preferences.
+## 💡 Usage Tips
+
+*   **OBS Integration:** Match your OBS recording filename format to `[%d-%m-%Y][%H-%M-%S]` for perfect synchronization between video files and timestamp logs.
+*   **Stream Deck/AHK:** Use these tools to map your hardware buttons to the `F13-F24` keys for a hands-free experience while gaming or recording.
+*   **Video Editing:** Use the generated Markdown files to quickly navigate your footage in editors like DaVinci Resolve or Premiere Pro.
+
+## 📄 License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+*Developed by Nilvarcus. Designed for creators, by a creator.*
