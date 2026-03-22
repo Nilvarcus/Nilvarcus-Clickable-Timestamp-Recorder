@@ -53,13 +53,13 @@ class TimestampManager:
             os.makedirs(target_dir)
 
         # Generate default filename with current timestamp
-        default_name = datetime.now().strftime("[%d-%m-%Y][%H-%M-%S] - WRITE HERE.txt")
+        default_name = datetime.now().strftime("[%d-%m-%Y][%H-%M-%S] - WRITE HERE.md")
         
         # Open file dialog
         file_name = filedialog.asksaveasfilename(
             title="Save File",
-            filetypes=[("Text Files", "*.txt")],
-            defaultextension=".txt",
+            filetypes=[("Markdown Files", "*.md"), ("Text Files", "*.txt")],
+            defaultextension=".md",
             initialdir=target_dir,
             initialfile=default_name,
         )
@@ -83,7 +83,7 @@ class TimestampManager:
             with open(self.current_file_path, "a", encoding="utf-8") as file:
                 timestamp = datetime.now().strftime("[%d-%m][%H-%M-%S]")
                 self.counter = 0  # Reset counter on start
-                file.write(f"\n0 - {timestamp} -\n\n")
+                file.write(f"\n## 0 - Filename: {timestamp}\n\n* **Starting Notes** - \n")
             self.start_time = time.time()
             self.stopwatch_running = True
             return True
@@ -101,7 +101,7 @@ class TimestampManager:
             formatted_time = time.strftime("[%H:%M:%S]", time.gmtime(elapsed_time))
             self.counter += 1  # Increment counter on each timestamp
             with open(self.current_file_path, "a", encoding="utf-8") as file:
-                file.write(f"\n{self.counter} - {formatted_time} -")
+                file.write(f"\n*  **[{self.counter}]**   **{formatted_time}** - ")
             return formatted_time
         return None
 
@@ -132,7 +132,7 @@ class TimestampManager:
             formatted_time = time.strftime("[%H:%M:%S]", time.gmtime(elapsed_time))
             self.counter += 1  # Increment counter on each timestamp
             with open(self.current_file_path, "a", encoding="utf-8") as file:
-                file.write(f"\n{self.counter} - {formatted_time} - {note_text}")
+                file.write(f"\n*  **[{self.counter}]**   **{formatted_time}** - {note_text}")
             return formatted_time
         return None
 
@@ -146,8 +146,9 @@ class TimestampManager:
         if self.current_file_path and self.stopwatch_running:
             elapsed_time = self.get_elapsed_time()
             with open(self.current_file_path, "a", encoding="utf-8") as file:
+                file.write(f"\n\n* **Ending Notes** - ")
                 file.write(f"\nTotal Recording Time: {elapsed_time}\n")
-                file.write("\n______________________________________________\n")
+                file.write("\n---\n")
             self.stopwatch_running = False
             self.start_time = None
             self.counter = 0  # Reset counter on stop
@@ -164,7 +165,7 @@ class TimestampManager:
         if self.current_file_path:
             with open(self.current_file_path, "a", encoding="utf-8") as file:
                 timestamp = datetime.now().strftime("[%d-%m][%H-%M-%S]")
-                file.write(f"\nSHORT-{timestamp} -\n\n")
+                file.write(f"\n\n## SHORT - {timestamp} - \n")
             return True
         return False
 
@@ -180,7 +181,11 @@ class TimestampManager:
         """
         if self.current_file_path:
             with open(self.current_file_path, "w", encoding="utf-8") as file:
-                file.write(text_content.strip())
+                # Remove only the very last newline that Tkinter adds automatically, 
+                # but keep all other trailing whitespace/spaces.
+                if text_content.endswith('\n'):
+                    text_content = text_content[:-1]
+                file.write(text_content)
             return True
         return False
 
@@ -249,7 +254,7 @@ class TimestampManager:
                 self.gui_callback("Transcribing...")
                 
             audio_data = recording.flatten()
-            result = self.whisper_model.transcribe(audio_data)
+            result = self.whisper_model.transcribe(audio_data, fp16=False)
             transcription = result['text'].strip()
             
             if self.gui_callback:
