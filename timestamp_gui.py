@@ -438,7 +438,7 @@ class TimestampApp:
             if status.startswith("COMPLETE|"):
                 transcription = status.split("|", 1)[1]
                 if transcription:
-                    self.text_viewer.insert(tk.END, f" *VOICE NOTE: {transcription}*\n")
+                    self.text_viewer.insert(tk.END, f" **Voice Note:** {transcription}\n")
                 self.save_changes()
                 
                 key_name = self.keybinds.get('mark_voice_note', 'N/A').upper()
