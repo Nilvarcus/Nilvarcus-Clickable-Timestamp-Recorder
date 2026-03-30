@@ -2,32 +2,31 @@
 
 ![App Screenshot](app_screenshot-2.0.png)
 
-A professional, streamlined Python application designed for content creators (e.g., OBS Studio, Replay Buffer users) to efficiently mark and manage timestamps during video recordings. Featuring a modern dark UI, global hotkey support, and AI-powered voice transcription.
+A professional, streamlined Python application designed for content creators to efficiently mark and manage timestamps during video recordings. It features a modern dark UI, global hotkeys, direct OBS WebSocket integration, live HUD Overlays, and AI-powered voice transcription.
 
 ## 🚀 Key Features
 
-*   **Modern Dark UI:** A sleek, high-contrast interface built with `CustomTkinter` for a professional look.
-*   **AI Voice Transcription:** Integrated `OpenAI Whisper` support. Record 10-second voice notes that are transcribed in the background and appended directly to your log.
-*   **Floating Status Widget:** An "Always-on-Top" mini-timer that displays recording status and confirms actions (e.g., "Timestamp Marked!") without obstructing your workspace.
-*   **Global Hotkeys:** Full support for `F13-F24` keys, allowing seamless integration with Stream Decks, AutoHotkey, or specialized macros.
-*   **Dynamic Custom Notes:** 5 configurable hotkeys to instantly inject pre-defined phrases (e.g., "Funny Moment", "Death", "Epic Play") into your timeline.
-*   **Advanced Markdown Formatting:** Generates clean, bolded, and highly readable `.md` files:
-    *   **Bolded Counters:** `**[1]**`
-    *   **Bolded Timestamps:** `**[00:00:00]**`
-    *   **Clean Separation:** Automatic newlines for Starting Notes, Ending Notes, and SHORTS.
-*   **Autosave & Persistence:** Background autosaving ensures you never lose a mark, even if the app closes unexpectedly.
+*   **Comprehensive OBS Integration:** Connects seamlessly to OBS Studio via WebSocket. Features bi-directional recording sync (triggering one starts the other), automatic Scene Transition logging into your timeline, and Replay Buffer capture hooks.
+*   **Dynamic HUD Overlay:** A customizable, game-ready transparent overlay featuring a live text feed of your latest tracked notes. The glowing border dynamically pulses based on backend state (Recording, Transcribing, Success, Error).
+*   **AI Voice Transcription:** Integrated `OpenAI Whisper` support. Record 10-second background voice clips or use the **Push-to-Talk** hotkey to record endless memos. Transcriptions are typed natively into your log file.
+*   **Synced Screenshots:** Instantly snap your primary gaming monitor natively without lag. Images auto-save to a dedicated `Screenshots/` folder and inject clean Markdown embed links right alongside your elapsed time.
+*   **Global Hotkeys:** Full hardware level support for `F13-F24` keys natively, bypassing UI focus. Maps perfectly onto a Stream Deck or Macro Pad.
+*   **Advanced Markdown Formatting:** Generates clean, bolded, highly readable `.txt` files built meticulously for Markdown previewing inside Obsidian or GitHub.
+*   **Configurable Environment:** Manually set custom `Output Directories`, define precise Microphone hardware, and tweak HUD opacities via an intuitive Settings graphical tab.
 
 ## ⌨️ Default Keybinds
 
 | Action | Key | Description |
 | :--- | :--- | :--- |
-| **Create/Open File** | `F13` | Initialize a new session file in the `Timestamp_TXT` folder. |
-| **Start Recording** | `F14` | Synchronize the stopwatch with your recording start. |
-| **Mark Time** | `F15` | Instantly drop a bolded timestamp mark. |
-| **Stop Recording** | `F16` | Finalize the log with total duration and a separator. |
-| **Voice Note** | `F17` | Record 10s of audio for AI transcription. |
-| **Save Short** | `F18` | Create a separated header for a Short or Replay Buffer clip. |
-| **Custom Notes** | `F20-F24`| Inject your 5 pre-configured text notes. |
+| **Create/Open File** | `F13` | Initialize a new session file in your target Output Folder. |
+| **Start Recording** | `F14` | Synchronize your stopwatch (and command OBS to start). |
+| **Mark Time** | `F15` | Instantly drop a bolded timestamp mark into the timeline. |
+| **Stop Recording** | `F16` | Finalize the log and stop OBS tracking. |
+| **Voice Note (10s)** | `F17` | Record a rapid 10s audio memo for AI transcription. |
+| **Voice Note (PTT)** | `Unbound`| Hold to record endless audio manually for up to 60s. |
+| **Save Short** | `F18` | Drops a bold header and saves your active OBS Replay Buffer. |
+| **Take Screenshot** | `F19` | Silently captures primary monitor and injects image markdown. |
+| **Custom Notes** | `F20-F24`| Inject your 5 pre-configured custom text markers natively. |
 
 ## 🛠️ Installation & Setup
 
@@ -37,8 +36,12 @@ A professional, streamlined Python application designed for content creators (e.
 
 ### Dependencies
 ```bash
-pip install customtkinter pynput openai-whisper sounddevice numpy
+pip install customtkinter pynput openai-whisper sounddevice numpy obsws-python Pillow
 ```
+
+### OBS Setup
+To allow the app to command your recordings and listen for Scene Changes, ensure OBS WebSocket is enabled natively:
+`Tools → OBS WebSocket Settings → Enable WebSockets (Port 4455)`
 
 ### Running the App
 ```bash
@@ -47,9 +50,7 @@ python timestamp_gui.py
 
 ## 💡 Usage Tips
 
-*   **OBS Integration:** Match your OBS recording filename format to `[%d-%m-%Y][%H-%M-%S]` for perfect synchronization between video files and timestamp logs.
-*   **Stream Deck/AHK:** Use these tools to map your hardware buttons to the `F13-F24` keys for a hands-free experience while gaming or recording.
-*   **Video Editing:** Use the generated Markdown files to quickly navigate your footage in editors like DaVinci Resolve or Premiere Pro.
+*   **Stream Deck Mapping:** Use your Elgato or macro software to map generic physical buttons to the `F13-F24` keys for a completely hands-free physical control deck while gaming.
 
 ## 📄 License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
