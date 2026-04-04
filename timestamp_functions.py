@@ -373,8 +373,9 @@ class TimestampManager:
                 self.ptt_audio_data.append(indata.copy())
 
         try:
+            max_seconds = 180
             if self.gui_callback:
-                self.gui_callback("PTT Recording...")
+                self.gui_callback(f"PTT Recording ({max_seconds}s)...")
                 
             stream = sd.InputStream(
                 samplerate=fs, channels=1, dtype='float32',
@@ -384,8 +385,8 @@ class TimestampManager:
             start_time = time.time()
             with stream:
                 while self.is_ptt_recording:
-                    # Hard limit of 60 seconds
-                    if time.time() - start_time > 60:
+                    # Hard limit
+                    if time.time() - start_time > max_seconds:
                         self.is_ptt_recording = False
                         if self.gui_callback:
                             self.gui_callback("Max Time Reached!")

@@ -65,9 +65,10 @@ class RecordingWidget(ctk.CTkToplevel):
         self.attributes('-topmost', True) # Keep window on top
         self.attributes('-alpha', parent.hud_opacity)
         
-        self.geometry("280x200")
-        self.minsize(280, 180)
+        self.geometry("210x110")
+        self.minsize(210, 110)
         self.resizable(False, False)
+        self._countdown_job = None
         
         self.create_widgets()
         self.update_timer()
@@ -90,23 +91,13 @@ class RecordingWidget(ctk.CTkToplevel):
         self.main_frame.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
         
         top_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        top_frame.pack(side=tk.TOP, fill=tk.X, pady=(10, 5))
+        top_frame.pack(expand=True, fill=tk.BOTH)
         
-        self.time_label = ctk.CTkLabel(top_frame, text="00:00:00", font=Theme.FONT_TITLE)
-        self.time_label.pack(side=tk.TOP)
+        self.time_label = ctk.CTkLabel(top_frame, text="00:00:00", font=(Theme.FONT_FAMILY, 34, "bold"))
+        self.time_label.pack(side=tk.TOP, expand=True, pady=(20, 0))
 
         self.status_label = ctk.CTkLabel(top_frame, text="", font=Theme.FONT_BODY, text_color=Theme.RED)
-        self.status_label.pack(side=tk.TOP)
-        
-        sep = ctk.CTkFrame(self.main_frame, height=2, fg_color=Theme.GREY)
-        sep.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
-        
-        self.log_textbox = ctk.CTkTextbox(
-            self.main_frame, font=Theme.FONT_BODY, fg_color="transparent", 
-            text_color="#DDDDDD", wrap=tk.WORD
-        )
-        self.log_textbox.pack(side=tk.TOP, expand=True, fill=tk.BOTH, padx=10, pady=(0, 10))
-        self.refresh_logs()
+        self.status_label.pack(side=tk.TOP, pady=(5, 10))
 
     def update_timer(self):
         if not self.winfo_exists(): return
@@ -163,6 +154,10 @@ class RecordingWidget(ctk.CTkToplevel):
         self._anim_job = self.after(50, self._animate_border)
 
     def show_status(self, message, duration=3000, color=Theme.GREEN):
+        if hasattr(self, '_countdown_job') and self._countdown_job and not message.startswith("Recording:"):
+            self.after_cancel(self._countdown_job)
+            self._countdown_job = None
+            
         self.status_label.configure(text=message, text_color=color)
         
         # Update border state temporally
@@ -179,17 +174,20 @@ class RecordingWidget(ctk.CTkToplevel):
             
         self._hide_status_job = self.after(duration, reset_status)
         
-    def refresh_logs(self):
-        events = self.parent.timestamp_manager.get_recent_log_events(count=3)
-        self.log_textbox.configure(state='normal')
-        self.log_textbox.delete("1.0", tk.END)
-        for e in events:
-            self.log_textbox.insert(tk.END, e + "\n\n")
-        self.log_textbox.see(tk.END)
-        self.log_textbox.configure(state='disabled')
+    def start_countdown(self, seconds_left):
+        if not self.winfo_exists(): return
+        if self._countdown_job:
+            self.after_cancel(self._countdown_job)
+            
+        if seconds_left > 0:
+            self.show_status(f"Recording: {seconds_left}s", duration=1500, color=Theme.PURPLE)
+            self._countdown_job = self.after(1000, lambda: self.start_countdown(seconds_left - 1))
+        else:
+            self.show_status("Transcribing...", duration=3000, color=Theme.ORANGE)
 
     def destroy(self):
         if hasattr(self, '_anim_job'): self.after_cancel(self._anim_job)
+        if hasattr(self, '_countdown_job') and self._countdown_job: self.after_cancel(self._countdown_job)
         if hasattr(self, '_hide_status_job') and self._hide_status_job: self.after_cancel(self._hide_status_job)
         super().destroy()
 
@@ -369,7 +367,8 @@ class SettingsWindow(ctk.CTkToplevel):
             ctk.CTkLabel(frame, text=f"{label_text}:", font=Theme.FONT_BODY, anchor='w').pack(
                 side=tk.LEFT, padx=(12, 0), pady=6)
 
-            key_str = self.new_keybinds.get(action_id, "N/A").upper()
+            key_str = self.new_keybinds.get(action_id, "").upper()
+            if not key_str: key_str = "UNBOUND"
             btn = ctk.CTkButton(
                 frame, text=key_str, font=Theme.FONT_BODY, width=100,
                 command=lambda aid=action_id: self.change_key(aid)
@@ -434,8 +433,17 @@ class SettingsWindow(ctk.CTkToplevel):
         def on_press_capture(key):
             new_key_str = self.parent.get_key_str(key)
             
+            if new_key_str == 'esc':
+                button.configure(text=original_text, state="normal")
+                return False
+                
+            if new_key_str in ('backspace', 'delete'):
+                self.new_keybinds[action_id] = ""
+                button.configure(text="UNBOUND", state="normal")
+                return False
+            
             for aid, bound_key in self.new_keybinds.items():
-                if bound_key == new_key_str and aid != action_id:
+                if bound_key == new_key_str and aid != action_id and bound_key != "":
                     messagebox.showerror("Error", f"Key '{new_key_str.upper()}' is already bound.", parent=self)
                     button.configure(text=original_text, state="normal")
                     return False
@@ -696,7 +704,8 @@ class TimestampApp:
 
     def update_button_text(self):
         for action_id, button in self.buttons.items():
-            key_name = self.keybinds.get(action_id, 'N/A').upper()
+            key_name = self.keybinds.get(action_id, '').upper()
+            if not key_name: key_name = 'UNBOUND'
             label_text = self.action_labels.get(action_id, 'Unknown')
             button.configure(text=f"{label_text} ({key_name})")
 
@@ -906,7 +915,8 @@ class TimestampApp:
                     self.text_viewer.insert(tk.END, f" **Voice Note:** {transcription}\n")
                 self.save_changes()
                 
-                key_name = self.keybinds.get('mark_voice_note', 'N/A').upper()
+                key_name = self.keybinds.get('mark_voice_note', '').upper()
+                if not key_name: key_name = 'UNBOUND'
                 label_text = self.action_labels.get('mark_voice_note', 'Unknown')
                 if 'mark_voice_note' in self.buttons:
                     self.buttons['mark_voice_note'].configure(text=f"{label_text} ({key_name})")
@@ -929,6 +939,12 @@ class TimestampApp:
                     self.voice_status_label.configure(text="⏳ Transcribing...", text_color=Theme.ORANGE)
                 elif "recording" in status.lower():
                     self.voice_status_label.configure(text="🎙️ RECORDING...", text_color=Theme.RED)
+                    import re
+                    match = re.search(r'\((\d+)s\)', status)
+                    if match:
+                        seconds = int(match.group(1))
+                        if hasattr(self, 'mini_widget') and self.mini_widget and self.mini_widget.winfo_exists():
+                            self.mini_widget.start_countdown(seconds)
                 else:
                     self.voice_status_label.configure(text=status, text_color=Theme.RED)
                     
@@ -943,8 +959,6 @@ class TimestampApp:
         self.text_viewer.delete("1.0", tk.END)
         self.text_viewer.insert(tk.END, text_content)
         self.text_viewer.see(tk.END)
-        if hasattr(self, 'mini_widget') and self.mini_widget and self.mini_widget.winfo_exists():
-            self.mini_widget.refresh_logs()
 
 def main():
     ctk.set_appearance_mode("Dark")
