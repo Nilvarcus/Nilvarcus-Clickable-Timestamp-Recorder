@@ -211,6 +211,9 @@ class SettingsWindow(ctk.CTkToplevel):
         self.new_obs_settings = parent.obs_settings.copy()
         self.new_hud_enabled = parent.hud_enabled
         self.new_hud_opacity = parent.hud_opacity
+        self.new_whisper_model = parent.whisper_model
+        self.new_whisper_language = parent.whisper_language
+        self.new_whisper_enabled = parent.whisper_enabled
         self.bind_buttons = {}
         self.text_entries = {}
         self._input_devices = get_input_devices()
@@ -312,6 +315,45 @@ class SettingsWindow(ctk.CTkToplevel):
         self.opacity_slider = ctk.CTkSlider(opacity_frame, from_=0.2, to=1.0, width=120)
         self.opacity_slider.set(self.new_hud_opacity)
         self.opacity_slider.pack(side=tk.LEFT)
+
+        # Whisper Settings — new row in General tab
+        whisper_frame = ctk.CTkFrame(gen)
+        whisper_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=(8, 8), pady=(8, 12))
+        whisper_frame.columnconfigure((0, 1), weight=1)
+
+        ctk.CTkLabel(whisper_frame, text="Whisper Model", font=Theme.FONT_SUBTITLE, anchor='w').grid(
+            row=0, column=0, sticky='w', padx=10, pady=(10, 2))
+        ctk.CTkLabel(whisper_frame, text="Transcription Language", font=Theme.FONT_SUBTITLE, anchor='w').grid(
+            row=0, column=1, sticky='w', padx=10, pady=(10, 2))
+
+        models = ["tiny", "base", "small", "medium", "turbo"]
+        self.model_var = ctk.StringVar(value=self.new_whisper_model)
+        ctk.CTkOptionMenu(
+            whisper_frame, values=models, variable=self.model_var, font=Theme.FONT_BODY).grid(
+            row=1, column=0, padx=10, pady=(2, 10), sticky='ew')
+
+        self.lang_entry = ctk.CTkEntry(whisper_frame, font=Theme.FONT_BODY)
+        self.lang_entry.insert(0, self.new_whisper_language)
+        self.lang_entry.grid(row=1, column=1, padx=10, pady=(2, 10), sticky='ew')
+
+        self.whisper_enabled_var = ctk.BooleanVar(value=self.new_whisper_enabled)
+        ctk.CTkSwitch(
+            whisper_frame, text="Enable Whisper Transcription",
+            variable=self.whisper_enabled_var, font=Theme.FONT_BODY,
+            progress_color=Theme.GREEN
+        ).grid(row=2, column=0, columnspan=2, padx=10, pady=(5, 10), sticky='w')
+
+        # Hardware Acceleration Status
+        hw_device = getattr(self.parent.timestamp_manager, 'whisper_device', 'cpu').upper()
+        hw_color = Theme.GREEN if hw_device == "CUDA" else Theme.ORANGE
+        hw_text = f"Hardware Acceleration: {hw_device}"
+        if hw_device == "CUDA":
+            hw_text += " (Active)"
+        else:
+            hw_text += " (CPU Only - Install CUDA torch to fix)"
+
+        ctk.CTkLabel(whisper_frame, text=hw_text, font=Theme.FONT_BODY, text_color=hw_color).grid(
+            row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='w')
 
         # ── OBS TAB ───────────────────────────────────────────────────────────
         obs = ctk.CTkScrollableFrame(tab_obs, fg_color="transparent")
@@ -485,8 +527,15 @@ class SettingsWindow(ctk.CTkToplevel):
         self.parent.obs_settings = self.new_obs_settings
         self.parent.hud_enabled = self.hud_var.get()
         self.parent.hud_opacity = self.opacity_slider.get()
+        self.parent.whisper_model = self.model_var.get()
+        self.parent.whisper_language = self.lang_entry.get().strip() or "en"
+        self.parent.whisper_enabled = self.whisper_enabled_var.get()
+        
         self.parent.timestamp_manager.set_output_dir(self.new_output_folder)
         self.parent.timestamp_manager.set_mic_device(self.new_mic_device_index)
+        self.parent.timestamp_manager.set_whisper_settings(
+            self.parent.whisper_model, self.parent.whisper_language, self.parent.whisper_enabled
+        )
         self.parent.save_keybinds()
         self.parent.update_button_text()
         self.destroy()
@@ -513,6 +562,9 @@ class TimestampApp:
         self.obs_settings = {
             'host': 'localhost', 'port': 4455, 'password': '', 'auto_connect': False
         }
+        self.whisper_model = "small"
+        self.whisper_language = "en"
+        self.whisper_enabled = True
         self.obs_manager = OBSManager(self.timestamp_manager)
         
         self.action_labels = {
@@ -579,6 +631,9 @@ class TimestampApp:
                     self.obs_settings.update(saved_obs)
                 self.hud_enabled = data.get('hud_enabled', True)
                 self.hud_opacity = data.get('hud_opacity', 0.8)
+                self.whisper_model = data.get('whisper_model', 'small')
+                self.whisper_language = data.get('whisper_language', 'en')
+                self.whisper_enabled = data.get('whisper_enabled', True)
             else:
                 self.keybinds = data
                 self.custom_texts = {}
@@ -594,9 +649,12 @@ class TimestampApp:
             self.keybinds = self.default_keybinds.copy()
             self.custom_texts = self.default_texts.copy()
         
-        # Apply the (possibly loaded) output folder and mic device to the manager
+        # Apply settings to the manager
         self.timestamp_manager.set_output_dir(self.output_folder)
         self.timestamp_manager.set_mic_device(self.mic_device_index)
+        self.timestamp_manager.set_whisper_settings(
+            self.whisper_model, self.whisper_language, self.whisper_enabled
+        )
         self.save_keybinds()
 
     def save_keybinds(self):
@@ -609,6 +667,9 @@ class TimestampApp:
                 'obs_settings': self.obs_settings,
                 'hud_enabled': self.hud_enabled,
                 'hud_opacity': self.hud_opacity,
+                'whisper_model': self.whisper_model,
+                'whisper_language': self.whisper_language,
+                'whisper_enabled': self.whisper_enabled,
             }
             json.dump(data, f, indent=4)
 
