@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import font, messagebox, filedialog
-from pynput import keyboard
+from pynput import keyboard, mouse
 from threading import Thread
 import json
 import os
@@ -10,6 +10,7 @@ import customtkinter as ctk
 # Import the TimestampManager and OBSManager from local modules
 from timestamp_functions import TimestampManager
 from timestamp_obs import OBSManager
+from timestamp_resolve import open_resolve_export_dialog
 
 def get_base_path() -> str:
     """Gets the base path for the application, whether running as a script or a frozen exe."""
@@ -64,9 +65,10 @@ class RecordingWidget(ctk.CTkToplevel):
         self.title("Recording HUD")
         self.attributes('-topmost', True) # Keep window on top
         self.attributes('-alpha', parent.hud_opacity)
+        self.overrideredirect(True)
         
-        self.geometry("210x110")
-        self.minsize(210, 110)
+        self.geometry("400x70")
+        self.minsize(300, 70)
         self.resizable(False, False)
         self._countdown_job = None
         
@@ -88,16 +90,30 @@ class RecordingWidget(ctk.CTkToplevel):
     def create_widgets(self):
         # We need a frame with a border for the glow
         self.main_frame = ctk.CTkFrame(self, fg_color="#1E1E1E", border_width=3, border_color=Theme.RED)
-        self.main_frame.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
+        self.main_frame.pack(expand=True, fill=tk.BOTH)
         
-        top_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        top_frame.pack(expand=True, fill=tk.BOTH)
+        content_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        content_frame.pack(expand=True, fill=tk.BOTH, padx=15, pady=5)
         
-        self.time_label = ctk.CTkLabel(top_frame, text="00:00:00", font=(Theme.FONT_FAMILY, 34, "bold"))
-        self.time_label.pack(side=tk.TOP, expand=True, pady=(20, 0))
+        self.time_label = ctk.CTkLabel(content_frame, text="00:00:00", font=(Theme.FONT_FAMILY, 32, "bold"))
+        self.time_label.pack(side=tk.LEFT, padx=(0, 20))
 
-        self.status_label = ctk.CTkLabel(top_frame, text="", font=Theme.FONT_BODY, text_color=Theme.RED)
-        self.status_label.pack(side=tk.TOP, pady=(5, 10))
+        self.status_label = ctk.CTkLabel(content_frame, text="", font=(Theme.FONT_FAMILY, 15, "bold"), text_color=Theme.RED)
+        self.status_label.pack(side=tk.RIGHT)
+
+        # Allow dragging the frameless window
+        for widget in (self, self.main_frame, content_frame, self.time_label, self.status_label):
+            widget.bind("<ButtonPress-1>", self.start_move)
+            widget.bind("<B1-Motion>", self.do_move)
+
+    def start_move(self, event):
+        self._drag_start_x = event.x_root - self.winfo_x()
+        self._drag_start_y = event.y_root - self.winfo_y()
+
+    def do_move(self, event):
+        x = event.x_root - self._drag_start_x
+        y = event.y_root - self._drag_start_y
+        self.geometry(f"+{x}+{y}")
 
     def update_timer(self):
         if not self.winfo_exists(): return
@@ -153,12 +169,15 @@ class RecordingWidget(ctk.CTkToplevel):
             
         self._anim_job = self.after(50, self._animate_border)
 
-    def show_status(self, message, duration=3000, color=Theme.GREEN):
-        if hasattr(self, '_countdown_job') and self._countdown_job and not message.startswith("Recording:"):
+    def show_status(self, message, duration=3000, color=Theme.GREEN, font=None):
+        if font is None:
+            font = (Theme.FONT_FAMILY, 15, "bold")
+
+        if hasattr(self, '_countdown_job') and self._countdown_job and not message.startswith("🎙️ REC:"):
             self.after_cancel(self._countdown_job)
             self._countdown_job = None
             
-        self.status_label.configure(text=message, text_color=color)
+        self.status_label.configure(text=message, text_color=color, font=font)
         
         # Update border state temporally
         if color == Theme.RED: self.set_border_state("error")
@@ -169,21 +188,22 @@ class RecordingWidget(ctk.CTkToplevel):
             self.after_cancel(self._hide_status_job)
             
         def reset_status():
-            self.status_label.configure(text="")
+            self.status_label.configure(text="", font=(Theme.FONT_FAMILY, 15, "bold"))
             self.set_border_state("recording")
             
         self._hide_status_job = self.after(duration, reset_status)
         
     def start_countdown(self, seconds_left):
         if not self.winfo_exists(): return
-        if self._countdown_job:
+        if getattr(self, '_countdown_job', None):
             self.after_cancel(self._countdown_job)
+            self._countdown_job = None
             
         if seconds_left > 0:
-            self.show_status(f"Recording: {seconds_left}s", duration=1500, color=Theme.PURPLE)
+            self.show_status(f"🎙️ REC: {seconds_left}s", duration=1500, color=Theme.RED, font=(Theme.FONT_FAMILY, 26, "bold"))
             self._countdown_job = self.after(1000, lambda: self.start_countdown(seconds_left - 1))
         else:
-            self.show_status("Transcribing...", duration=3000, color=Theme.ORANGE)
+            self.show_status("Transcribing...", duration=3000, color=Theme.ORANGE, font=(Theme.FONT_FAMILY, 15, "bold"))
 
     def destroy(self):
         if hasattr(self, '_anim_job'): self.after_cancel(self._anim_job)
@@ -211,6 +231,10 @@ class SettingsWindow(ctk.CTkToplevel):
         self.new_obs_settings = parent.obs_settings.copy()
         self.new_hud_enabled = parent.hud_enabled
         self.new_hud_opacity = parent.hud_opacity
+        self.new_whisper_model = parent.whisper_model
+        self.new_whisper_language = parent.whisper_language
+        self.new_whisper_enabled = parent.whisper_enabled
+        self.new_voice_note_length = parent.voice_note_length
         self.bind_buttons = {}
         self.text_entries = {}
         self._input_devices = get_input_devices()
@@ -312,6 +336,51 @@ class SettingsWindow(ctk.CTkToplevel):
         self.opacity_slider = ctk.CTkSlider(opacity_frame, from_=0.2, to=1.0, width=120)
         self.opacity_slider.set(self.new_hud_opacity)
         self.opacity_slider.pack(side=tk.LEFT)
+
+        # Whisper Settings — new row in General tab
+        whisper_frame = ctk.CTkFrame(gen)
+        whisper_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=(8, 8), pady=(8, 12))
+        whisper_frame.columnconfigure((0, 1), weight=1)
+
+        ctk.CTkLabel(whisper_frame, text="Whisper Model", font=Theme.FONT_SUBTITLE, anchor='w').grid(
+            row=0, column=0, sticky='w', padx=10, pady=(10, 2))
+        ctk.CTkLabel(whisper_frame, text="Transcription Language", font=Theme.FONT_SUBTITLE, anchor='w').grid(
+            row=0, column=1, sticky='w', padx=10, pady=(10, 2))
+
+        models = ["tiny", "base", "small", "medium", "turbo"]
+        self.model_var = ctk.StringVar(value=self.new_whisper_model)
+        ctk.CTkOptionMenu(
+            whisper_frame, values=models, variable=self.model_var, font=Theme.FONT_BODY).grid(
+            row=1, column=0, padx=10, pady=(2, 10), sticky='ew')
+
+        self.lang_entry = ctk.CTkEntry(whisper_frame, font=Theme.FONT_BODY)
+        self.lang_entry.insert(0, self.new_whisper_language)
+        self.lang_entry.grid(row=1, column=1, padx=10, pady=(2, 10), sticky='ew')
+
+        self.whisper_enabled_var = ctk.BooleanVar(value=self.new_whisper_enabled)
+        ctk.CTkSwitch(
+            whisper_frame, text="Enable Whisper",
+            variable=self.whisper_enabled_var, font=Theme.FONT_BODY,
+            progress_color=Theme.GREEN
+        ).grid(row=2, column=0, padx=10, pady=(5, 10), sticky='w')
+
+        length_frame = ctk.CTkFrame(whisper_frame, fg_color="transparent")
+        length_frame.grid(row=2, column=1, sticky='e', padx=10, pady=(5, 10))
+        ctk.CTkLabel(length_frame, text="Note Length (s):", font=Theme.FONT_BODY).pack(side=tk.LEFT, padx=(0, 5))
+        self.voice_note_length_var = ctk.StringVar(value=str(self.new_voice_note_length))
+        ctk.CTkEntry(length_frame, textvariable=self.voice_note_length_var, font=Theme.FONT_BODY, width=50).pack(side=tk.LEFT)
+
+        # Hardware Acceleration Status
+        hw_device = getattr(self.parent.timestamp_manager, 'whisper_device', 'cpu').upper()
+        hw_color = Theme.GREEN if hw_device == "CUDA" else Theme.ORANGE
+        hw_text = f"Hardware Acceleration: {hw_device}"
+        if hw_device == "CUDA":
+            hw_text += " (Active)"
+        else:
+            hw_text += " (CPU Only - Install CUDA torch to fix)"
+
+        ctk.CTkLabel(whisper_frame, text=hw_text, font=Theme.FONT_BODY, text_color=hw_color).grid(
+            row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='w')
 
         # ── OBS TAB ───────────────────────────────────────────────────────────
         obs = ctk.CTkScrollableFrame(tab_obs, fg_color="transparent")
@@ -429,31 +498,72 @@ class SettingsWindow(ctk.CTkToplevel):
         button = self.bind_buttons[action_id]
         original_text = button.cget('text')
         button.configure(text="Press a key...", state="disabled")
+        
+        capture_done = False
+        
+        def stop_listeners():
+            if kb_listener.running: kb_listener.stop()
+            if ms_listener.running: ms_listener.stop()
 
         def on_press_capture(key):
+            nonlocal capture_done
+            if capture_done: return False
             new_key_str = self.parent.get_key_str(key)
             
             if new_key_str == 'esc':
                 button.configure(text=original_text, state="normal")
+                capture_done = True
+                stop_listeners()
                 return False
                 
             if new_key_str in ('backspace', 'delete'):
                 self.new_keybinds[action_id] = ""
                 button.configure(text="UNBOUND", state="normal")
+                capture_done = True
+                stop_listeners()
                 return False
             
             for aid, bound_key in self.new_keybinds.items():
                 if bound_key == new_key_str and aid != action_id and bound_key != "":
-                    messagebox.showerror("Error", f"Key '{new_key_str.upper()}' is already bound.", parent=self)
+                    self.parent.root.after(0, lambda n=new_key_str: messagebox.showerror("Error", f"Key '{n.upper()}' is already bound.", parent=self))
                     button.configure(text=original_text, state="normal")
+                    capture_done = True
+                    stop_listeners()
                     return False
 
             self.new_keybinds[action_id] = new_key_str
             button.configure(text=new_key_str.upper(), state="normal")
+            capture_done = True
+            stop_listeners()
             return False
 
-        listener = keyboard.Listener(on_press=on_press_capture)
-        listener.start()
+        def on_click_capture(x, y, button_event, pressed):
+            nonlocal capture_done
+            if not pressed or capture_done: return
+            
+            if button_event in (mouse.Button.left, mouse.Button.right):
+                return
+                
+            new_key_str = f"mouse_{button_event.name}"
+            
+            for aid, bound_key in self.new_keybinds.items():
+                if bound_key == new_key_str and aid != action_id and bound_key != "":
+                    self.parent.root.after(0, lambda n=new_key_str: messagebox.showerror("Error", f"Key '{n.upper()}' is already bound.", parent=self))
+                    button.configure(text=original_text, state="normal")
+                    capture_done = True
+                    stop_listeners()
+                    return False
+
+            self.new_keybinds[action_id] = new_key_str
+            button.configure(text=new_key_str.upper(), state="normal")
+            capture_done = True
+            stop_listeners()
+            return False
+
+        kb_listener = keyboard.Listener(on_press=on_press_capture)
+        ms_listener = mouse.Listener(on_click=on_click_capture)
+        kb_listener.start()
+        ms_listener.start()
 
     def save_and_close(self):
         # Save custom texts from entries
@@ -485,8 +595,22 @@ class SettingsWindow(ctk.CTkToplevel):
         self.parent.obs_settings = self.new_obs_settings
         self.parent.hud_enabled = self.hud_var.get()
         self.parent.hud_opacity = self.opacity_slider.get()
+        self.parent.whisper_model = self.model_var.get()
+        self.parent.whisper_language = self.lang_entry.get().strip() or "en"
+        self.parent.whisper_enabled = self.whisper_enabled_var.get()
+        try:
+            length = int(self.voice_note_length_var.get())
+            if length < 1: length = 1
+        except ValueError:
+            length = 10
+        self.parent.voice_note_length = length
+        
         self.parent.timestamp_manager.set_output_dir(self.new_output_folder)
         self.parent.timestamp_manager.set_mic_device(self.new_mic_device_index)
+        self.parent.timestamp_manager.set_whisper_settings(
+            self.parent.whisper_model, self.parent.whisper_language, self.parent.whisper_enabled
+        )
+        self.parent.timestamp_manager.set_voice_note_length(self.parent.voice_note_length)
         self.parent.save_keybinds()
         self.parent.update_button_text()
         self.destroy()
@@ -513,6 +637,10 @@ class TimestampApp:
         self.obs_settings = {
             'host': 'localhost', 'port': 4455, 'password': '', 'auto_connect': False
         }
+        self.whisper_model = "small"
+        self.whisper_language = "en"
+        self.whisper_enabled = True
+        self.voice_note_length = 10
         self.obs_manager = OBSManager(self.timestamp_manager)
         
         self.action_labels = {
@@ -520,6 +648,8 @@ class TimestampApp:
             'mark_time': "Mark Time", 'stop_recording': "Stop Recording",
             'save_short': "Save Short", 'mark_voice_note': "Voice Note",
             'take_screenshot': "Take Screenshot", 'mark_ptt_voice_note': "PTT Voice Note",
+            'mark_secondary_ptt_voice_note': "Secondary PTT Voice Note",
+            'mark_secondary_voice_note': "Secondary Voice Note", 'resolve_export': "Resolve Export",
             'custom_note_1': "Custom Note 1", 'custom_note_2': "Custom Note 2",
             'custom_note_3': "Custom Note 3", 'custom_note_4': "Custom Note 4",
             'custom_note_5': "Custom Note 5",
@@ -528,7 +658,8 @@ class TimestampApp:
             'create_file': 'f13', 'start_recording': 'f14', 'mark_time': 'f15',
             'stop_recording': 'f16', 'save_short': 'f18', 'mark_voice_note': 'f17',
             'take_screenshot': 'f19', 'mark_ptt_voice_note': '',
-            'custom_note_1': 'f20', 'custom_note_2': 'f21', 'custom_note_3': 'f22',
+            'mark_secondary_ptt_voice_note': '', 'mark_secondary_voice_note': '',
+            'resolve_export': '', 'custom_note_1': 'f20', 'custom_note_2': 'f21', 'custom_note_3': 'f22',
             'custom_note_4': 'f23', 'custom_note_5': 'f24',
         }
         self.default_texts = {
@@ -579,6 +710,10 @@ class TimestampApp:
                     self.obs_settings.update(saved_obs)
                 self.hud_enabled = data.get('hud_enabled', True)
                 self.hud_opacity = data.get('hud_opacity', 0.8)
+                self.whisper_model = data.get('whisper_model', 'small')
+                self.whisper_language = data.get('whisper_language', 'en')
+                self.whisper_enabled = data.get('whisper_enabled', True)
+                self.voice_note_length = data.get('voice_note_length', 10)
             else:
                 self.keybinds = data
                 self.custom_texts = {}
@@ -594,9 +729,13 @@ class TimestampApp:
             self.keybinds = self.default_keybinds.copy()
             self.custom_texts = self.default_texts.copy()
         
-        # Apply the (possibly loaded) output folder and mic device to the manager
+        # Apply settings to the manager
         self.timestamp_manager.set_output_dir(self.output_folder)
         self.timestamp_manager.set_mic_device(self.mic_device_index)
+        self.timestamp_manager.set_whisper_settings(
+            self.whisper_model, self.whisper_language, self.whisper_enabled
+        )
+        self.timestamp_manager.set_voice_note_length(getattr(self, 'voice_note_length', 10))
         self.save_keybinds()
 
     def save_keybinds(self):
@@ -609,6 +748,10 @@ class TimestampApp:
                 'obs_settings': self.obs_settings,
                 'hud_enabled': self.hud_enabled,
                 'hud_opacity': self.hud_opacity,
+                'whisper_model': self.whisper_model,
+                'whisper_language': self.whisper_language,
+                'whisper_enabled': self.whisper_enabled,
+                'voice_note_length': getattr(self, 'voice_note_length', 10),
             }
             json.dump(data, f, indent=4)
 
@@ -689,14 +832,12 @@ class TimestampApp:
             'save_short': (self.save_short, Theme.TURQUOISE, Theme.HOVER_TURQUOISE, 2, 0),
             'mark_voice_note': (self.mark_voice_note, Theme.PURPLE, Theme.HOVER_PURPLE, 2, 1),
             'take_screenshot': (self.take_screenshot, Theme.TURQUOISE, Theme.HOVER_TURQUOISE, 3, 0),
+            'resolve_export': (self.open_resolve_dialog, Theme.BLUE, Theme.HOVER_BLUE, 3, 1),
         }
 
         for action_id, (command, bg, hover, row, col) in button_config.items():
             btn = ctk.CTkButton(button_frame, command=command, fg_color=bg, hover_color=hover, font=Theme.FONT_BUTTON)
-            if action_id == 'take_screenshot':
-                btn.grid(row=row, column=0, columnspan=2, padx=4, pady=4, sticky='ew')
-            else:
-                btn.grid(row=row, column=col, padx=4, pady=4, sticky='ew')
+            btn.grid(row=row, column=col, padx=4, pady=4, sticky='ew')
             self.buttons[action_id] = btn
 
         settings_btn = ctk.CTkButton(button_frame, text="Settings", command=self.open_settings_window, fg_color=Theme.GREY, hover_color=Theme.HOVER_GREY, font=Theme.FONT_BUTTON)
@@ -722,7 +863,11 @@ class TimestampApp:
             'create_file': self.create_file, 'start_recording': self.start_recording,
             'mark_time': self.mark_time, 'stop_recording': self.stop_recording,
             'save_short': self.save_short, 'mark_voice_note': self.mark_voice_note,
+            'take_screenshot': self.take_screenshot,
+            'resolve_export': self.open_resolve_dialog,
             'mark_ptt_voice_note': self.start_ptt_voice_note,
+            'mark_secondary_ptt_voice_note': self.start_secondary_ptt_voice_note,
+            'mark_secondary_voice_note': self.mark_secondary_voice_note,
             'custom_note_1': lambda: self.mark_custom_note_n('custom_note_1'),
             'custom_note_2': lambda: self.mark_custom_note_n('custom_note_2'),
             'custom_note_3': lambda: self.mark_custom_note_n('custom_note_3'),
@@ -731,6 +876,7 @@ class TimestampApp:
         }
         self.pressed_keys = set()
         Thread(target=lambda: keyboard.Listener(on_press=self._on_press, on_release=self._on_release).start(), daemon=True).start()
+        Thread(target=lambda: mouse.Listener(on_click=self._on_mouse_click).start(), daemon=True).start()
 
     def _on_press(self, key):
         key_str = self.get_key_str(key)
@@ -756,11 +902,38 @@ class TimestampApp:
         action_id = key_to_action.get(key_str)
         
         # Handle features that require an explicit release trigger
-        if action_id == 'mark_ptt_voice_note':
+        if action_id in ('mark_ptt_voice_note', 'mark_secondary_ptt_voice_note'):
             try:
                 self.root.after(0, self.stop_ptt_voice_note)
             except Exception as e:
                 print(f"Error executing release action '{action_id}': {e}")
+
+    def _on_mouse_click(self, x, y, button, pressed):
+        key_str = f"mouse_{button.name}"
+        if not pressed:
+            if key_str in self.pressed_keys:
+                self.pressed_keys.remove(key_str)
+                
+            key_to_action = {v: k for k, v in self.keybinds.items() if v}
+            action_id = key_to_action.get(key_str)
+            if action_id in ('mark_ptt_voice_note', 'mark_secondary_ptt_voice_note'):
+                try:
+                    self.root.after(0, self.stop_ptt_voice_note)
+                except Exception as e:
+                    print(f"Error executing release action '{action_id}': {e}")
+            return
+            
+        if key_str in self.pressed_keys:
+            return
+        self.pressed_keys.add(key_str)
+        
+        key_to_action = {v: k for k, v in self.keybinds.items() if v}
+        action_id = key_to_action.get(key_str)
+        if action_id in self.action_map:
+            try:
+                self.root.after(0, self.action_map[action_id])
+            except Exception as e:
+                print(f"Error executing action '{action_id}': {e}")
 
     def create_file(self):
         file_path = self.timestamp_manager.create_file()
@@ -822,6 +995,11 @@ class TimestampApp:
         if self.timestamp_manager.mark_voice_note():
             pass
 
+    def mark_secondary_voice_note(self):
+        self.save_changes()
+        if self.timestamp_manager.mark_voice_note(secondary=True):
+            pass
+
     def take_screenshot(self):
         self.save_changes()
         if self.timestamp_manager.take_screenshot():
@@ -829,10 +1007,19 @@ class TimestampApp:
             if self.mini_widget and self.mini_widget.winfo_exists():
                 self.mini_widget.show_status("Screenshot Saved!", color=Theme.TURQUOISE)
 
+    def open_resolve_dialog(self):
+        self.save_changes()
+        open_resolve_export_dialog(self)
+
     def start_ptt_voice_note(self):
         self.save_changes()
         self.mark_time()
         if self.timestamp_manager.start_ptt_voice_note():
+            pass
+
+    def start_secondary_ptt_voice_note(self):
+        self.save_changes()
+        if self.timestamp_manager.start_ptt_voice_note(secondary=True):
             pass
             
     def stop_ptt_voice_note(self):
@@ -909,10 +1096,15 @@ class TimestampApp:
 
     def on_transcription_status(self, status):
         def update_gui():
-            if status.startswith("COMPLETE|"):
-                transcription = status.split("|", 1)[1]
+            if status.startswith("COMPLETE|") or status.startswith("COMPLETE_SECONDARY|"):
+                is_secondary = status.startswith("COMPLETE_SECONDARY|")
+                prefix = "COMPLETE_SECONDARY|" if is_secondary else "COMPLETE|"
+                transcription = status.split(prefix, 1)[1]
                 if transcription:
-                    self.text_viewer.insert(tk.END, f" **Voice Note:** {transcription}\n")
+                    if is_secondary:
+                        self.text_viewer.insert(tk.END, f"\n* **Note:** {transcription}\n")
+                    else:
+                        self.text_viewer.insert(tk.END, f"{transcription}\n")
                 self.save_changes()
                 
                 key_name = self.keybinds.get('mark_voice_note', '').upper()

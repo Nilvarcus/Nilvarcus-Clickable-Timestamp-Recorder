@@ -1,0 +1,17 @@
+# Build and distribution
+build/
+dist/
+__pycache__/
+*.spec
+
+# IDE settings
+.vscode/
+
+# Local data and secrets
+keybinds.json
+Timestamp_TXT/
+patch-notes/
+patchnotes-*.md
+recording_temp.wav
+planning_features.md
+GEMINI.md

@@ -15,19 +15,61 @@ class TimestampManager:
         self.output_dir = os.path.join(self.base_path, "Timestamp_TXT")
 
         self.whisper_model = None
+        self.whisper_model_name = "small"  # Default to small as requested
+        self.whisper_language = "en"     # Default
+        self.whisper_enabled = True      # Default to enabled
+        self.voice_note_length = 10      # Default
         self.is_transcribing = False
         self.gui_callback = None
         self.mic_device_index = None  # None = system default
         
-        # Load whisper in background to avoid freezing the app
-        import threading
-        threading.Thread(target=self._load_whisper_model, daemon=True).start()
+        # Device detection for Whisper
+        import torch
+        self.whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Whisper device detected: {self.whisper_device}")
+
+        # Loading is now handled by the GUI after settings are loaded
+
+    def set_whisper_settings(self, model_name: str, language: str, enabled: bool = True):
+        """Set whisper model, language and enabled state. If model changes, it will need to be reloaded."""
+        self.whisper_enabled = enabled
+        self.whisper_language = language
+
+        if not enabled:
+            if self.whisper_model is not None:
+                self.unload_whisper_model()
+            return
+
+        if model_name != self.whisper_model_name or self.whisper_model is None:
+            self.whisper_model_name = model_name
+            self.whisper_model = None  # Trigger reload
+            import threading
+            threading.Thread(target=self._load_whisper_model, daemon=True).start()
+
+    def set_voice_note_length(self, length: int):
+        """Set the duration of a voice note recording in seconds."""
+        self.voice_note_length = length
+
+    def unload_whisper_model(self):
+        """Unload the whisper model and free up memory/VRAM."""
+        import gc
+        import torch
+        self.whisper_model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Whisper model unloaded and memory cleared.")
 
     def _load_whisper_model(self):
+        if not self.whisper_enabled:
+            return
+        
         try:
             import whisper
-            self.whisper_model = whisper.load_model("base")
-            print("Whisper model loaded.")
+            model_to_load = self.whisper_model_name
+            # Explicitly set the device during loading
+            self.whisper_model = whisper.load_model(model_to_load, device=self.whisper_device)
+            print(f"Whisper model '{model_to_load}' loaded on {self.whisper_device}.")
         except Exception as e:
             print(f"Error loading whisper: {e}")
 
@@ -258,7 +300,7 @@ class TimestampManager:
             print(f"Error taking screenshot: {e}")
             return False
 
-    def mark_voice_note(self):
+    def mark_voice_note(self, secondary=False):
         """
         Record a 10s voice note, transcribe it using Whisper, and mark in the file asynchronously.
         
@@ -266,15 +308,19 @@ class TimestampManager:
             bool: True if recording started, False otherwise.
         """
         if self.current_file_path and self.stopwatch_running:
+            if not self.whisper_enabled:
+                if self.gui_callback:
+                    self.gui_callback("Whisper Disabled")
+                return False
             if getattr(self, 'is_transcribing', False):
                 return False
             self.is_transcribing = True
             import threading
-            threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+            threading.Thread(target=self._record_and_transcribe, args=(secondary,), daemon=True).start()
             return True
         return False
 
-    def _record_and_transcribe(self):
+    def _record_and_transcribe(self, secondary=False):
         import sounddevice as sd
         import numpy as np
         
@@ -292,12 +338,12 @@ class TimestampManager:
                 self.is_transcribing = False
                 return
             
-        duration = 10  # seconds
+        duration = getattr(self, 'voice_note_length', 10)  # seconds
         fs = 16000
         
         try:
             if self.gui_callback:
-                self.gui_callback("Recording (10s)...")
+                self.gui_callback(f"Recording ({duration}s)...")
                 
             recording = sd.rec(
                 int(duration * fs), samplerate=fs, channels=1, dtype='float32',
@@ -309,12 +355,19 @@ class TimestampManager:
                 self.gui_callback("Transcribing...")
                 
             audio_data = recording.flatten()
-            result = self.whisper_model.transcribe(audio_data, fp16=False)
+            # Enable fp16 only on GPU for performance; CPU requires fp16=False
+            use_fp16 = True if self.whisper_device == "cuda" else False
+            result = self.whisper_model.transcribe(
+                audio_data, 
+                fp16=use_fp16, 
+                language=self.whisper_language
+            )
             transcription = result['text'].strip()
             
             if self.gui_callback:
                 # Use a specific format to pass the result back to the GUI
-                self.gui_callback(f"COMPLETE|{transcription}")
+                prefix = "COMPLETE_SECONDARY|" if secondary else "COMPLETE|"
+                self.gui_callback(f"{prefix}{transcription}")
                 
         except Exception as e:
             print(f"Transcription error: {e}")
@@ -325,14 +378,19 @@ class TimestampManager:
         finally:
             self.is_transcribing = False
 
-    def start_ptt_voice_note(self):
+    def start_ptt_voice_note(self, secondary=False):
         """Start a push-to-talk voice recording."""
         if not self.current_file_path or not self.stopwatch_running:
+            return False
+        if not self.whisper_enabled:
+            if self.gui_callback:
+                self.gui_callback("Whisper Disabled")
             return False
         if getattr(self, 'is_transcribing', False) or getattr(self, 'is_ptt_recording', False):
             return False
             
         self.is_ptt_recording = True
+        self.ptt_secondary = secondary
         self.ptt_audio_data = []
         
         import threading
@@ -420,12 +478,19 @@ class TimestampManager:
             full_audio = np.concatenate(self.ptt_audio_data, axis=0)
             audio_data = full_audio.flatten()
             
-            result = self.whisper_model.transcribe(audio_data, fp16=False)
+            # Enable fp16 only on GPU for performance; CPU requires fp16=False
+            use_fp16 = True if self.whisper_device == "cuda" else False
+            result = self.whisper_model.transcribe(
+                audio_data, 
+                fp16=use_fp16, 
+                language=self.whisper_language
+            )
             transcription = result['text'].strip()
             
             if transcription:
                 if self.gui_callback:
-                    self.gui_callback(f"COMPLETE|{transcription}")
+                    prefix = "COMPLETE_SECONDARY|" if getattr(self, 'ptt_secondary', False) else "COMPLETE|"
+                    self.gui_callback(f"{prefix}{transcription}")
             else:
                 if self.gui_callback:
                     self.gui_callback("No speech detected")
