@@ -20,6 +20,8 @@ class TimestampManager:
         self.whisper_enabled = True      # Default to enabled
         self.voice_note_length = 10      # Default
         self.is_transcribing = False
+        self.is_voice_recording = False
+        self.is_ptt_recording = False
         self.gui_callback = None
         self.mic_device_index = None  # None = system default
         
@@ -29,6 +31,26 @@ class TimestampManager:
         print(f"Whisper device detected: {self.whisper_device}")
 
         # Loading is now handled by the GUI after settings are loaded
+
+    def _is_mic_available(self):
+        """Check if any audio input device is available."""
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            if not devices:
+                return False
+            
+            # If no specific device set, check if a default input exists
+            if self.mic_device_index is None:
+                default_input = sd.default.device[0]
+                return default_input >= 0
+            
+            # Check if set device index is valid and has input channels
+            device_info = sd.query_devices(self.mic_device_index, 'input')
+            return device_info['max_input_channels'] > 0
+        except Exception as e:
+            print(f"Mic availability check failed: {e}")
+            return False
 
     def set_whisper_settings(self, model_name: str, language: str, enabled: bool = True):
         """Set whisper model, language and enabled state. If model changes, it will need to be reloaded."""
@@ -191,12 +213,22 @@ class TimestampManager:
 
     def stop_recording(self):
         """
-        Stop and reset the stopwatch.
+        Stop and reset the stopwatch. Terminates any active voice note recording.
         
         Returns:
             bool: True if recording stopped successfully, False otherwise.
         """
         if self.current_file_path and self.stopwatch_running:
+            # Stop any active audio streams
+            try:
+                import sounddevice as sd
+                sd.stop()
+            except Exception:
+                pass
+                
+            self.is_voice_recording = False
+            self.is_ptt_recording = False
+            
             elapsed_time = self.get_elapsed_time()
             with open(self.current_file_path, "a", encoding="utf-8") as file:
                 file.write(f"\n\n* **Ending Notes** - ")
@@ -312,6 +344,13 @@ class TimestampManager:
                 if self.gui_callback:
                     self.gui_callback("Whisper Disabled")
                 return False
+            
+            # Pre-flight mic check
+            if not self._is_mic_available():
+                if self.gui_callback:
+                    self.gui_callback("Error: No Microphone")
+                return False
+
             if getattr(self, 'is_transcribing', False):
                 return False
             self.is_transcribing = True
@@ -345,22 +384,40 @@ class TimestampManager:
             if self.gui_callback:
                 self.gui_callback(f"Recording ({duration}s)...")
                 
+            self.is_voice_recording = True
             recording = sd.rec(
                 int(duration * fs), samplerate=fs, channels=1, dtype='float32',
                 device=self.mic_device_index
             )
             sd.wait()
             
+            # Check if we were cancelled during the wait
+            if not self.is_voice_recording or not self.stopwatch_running:
+                if self.gui_callback:
+                    self.gui_callback("CANCELLED")
+                return
+                
+            audio_data = recording.flatten()
+
+            # --- SILENCE FILTER ---
+            # Calculate RMS (Root Mean Square) energy to detect silence
+            rms = np.sqrt(np.mean(audio_data**2))
+            if rms < 0.003: # Threshold for near-silence
+                if self.gui_callback:
+                    self.gui_callback("No speech detected")
+                return
+            # ----------------------
+                
             if self.gui_callback:
                 self.gui_callback("Transcribing...")
                 
-            audio_data = recording.flatten()
             # Enable fp16 only on GPU for performance; CPU requires fp16=False
             use_fp16 = True if self.whisper_device == "cuda" else False
             result = self.whisper_model.transcribe(
                 audio_data, 
                 fp16=use_fp16, 
-                language=self.whisper_language
+                language=self.whisper_language,
+                condition_on_previous_text=False # Prevents 'you' hallucinations
             )
             transcription = result['text'].strip()
             
@@ -372,11 +429,12 @@ class TimestampManager:
         except Exception as e:
             print(f"Transcription error: {e}")
             if self.gui_callback:
-                self.gui_callback("Error")
+                self.gui_callback("Error: Recording Failed")
             import time
             time.sleep(2)
         finally:
             self.is_transcribing = False
+            self.is_voice_recording = False
 
     def start_ptt_voice_note(self, secondary=False):
         """Start a push-to-talk voice recording."""
@@ -386,6 +444,13 @@ class TimestampManager:
             if self.gui_callback:
                 self.gui_callback("Whisper Disabled")
             return False
+            
+        # Pre-flight mic check
+        if not self._is_mic_available():
+            if self.gui_callback:
+                self.gui_callback("Error: No Microphone")
+            return False
+
         if getattr(self, 'is_transcribing', False) or getattr(self, 'is_ptt_recording', False):
             return False
             
@@ -451,13 +516,19 @@ class TimestampManager:
                         break
                     time.sleep(0.1)
             
-            # Now stream is closed. Process audio.
-            self._process_ptt_audio()
-            
+            # Now stream is closed. Process audio if we have any.
+            if self.ptt_audio_data:
+                self._process_ptt_audio()
+            else:
+                self.is_ptt_recording = False
+                if self.gui_callback:
+                    self.gui_callback("No Audio")
+                
         except Exception as e:
             print(f"PTT Record error: {e}")
             if self.gui_callback:
-                self.gui_callback("Error")
+                self.gui_callback("Error: Mic Failed")
+        finally:
             self.is_ptt_recording = False
 
     def _process_ptt_audio(self):
@@ -478,12 +549,21 @@ class TimestampManager:
             full_audio = np.concatenate(self.ptt_audio_data, axis=0)
             audio_data = full_audio.flatten()
             
+            # --- SILENCE FILTER ---
+            rms = np.sqrt(np.mean(audio_data**2))
+            if rms < 0.003:
+                if self.gui_callback:
+                    self.gui_callback("No speech detected")
+                return
+            # ----------------------
+
             # Enable fp16 only on GPU for performance; CPU requires fp16=False
             use_fp16 = True if self.whisper_device == "cuda" else False
             result = self.whisper_model.transcribe(
                 audio_data, 
                 fp16=use_fp16, 
-                language=self.whisper_language
+                language=self.whisper_language,
+                condition_on_previous_text=False # Prevents 'you' hallucinations
             )
             transcription = result['text'].strip()
             

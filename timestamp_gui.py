@@ -1127,6 +1127,12 @@ class TimestampApp:
                 # Update main GUI voice status header
                 if "error" in status.lower() or "no audio" in status.lower():
                     self.voice_status_label.configure(text=status, text_color=Theme.RED)
+                    # Revert button text and clear status after short delay
+                    def reset_error_gui():
+                        self.update_button_text()
+                        if self.voice_status_label.cget("text") == status:
+                            self.voice_status_label.configure(text="")
+                    self.root.after(4000, reset_error_gui)
                 elif "transcribing" in status.lower():
                     self.voice_status_label.configure(text="⏳ Transcribing...", text_color=Theme.ORANGE)
                 elif "recording" in status.lower():
@@ -1137,6 +1143,11 @@ class TimestampApp:
                         seconds = int(match.group(1))
                         if hasattr(self, 'mini_widget') and self.mini_widget and self.mini_widget.winfo_exists():
                             self.mini_widget.start_countdown(seconds)
+                elif "cancelled" in status.lower():
+                    self.update_button_text()
+                    self.voice_status_label.configure(text="")
+                    if self.mini_widget and self.mini_widget.winfo_exists():
+                        self.mini_widget.show_status("Cancelled", color=Theme.GREY)
                 else:
                     self.voice_status_label.configure(text=status, text_color=Theme.RED)
                     
