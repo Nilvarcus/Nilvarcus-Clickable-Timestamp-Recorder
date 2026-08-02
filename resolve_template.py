@@ -99,7 +99,9 @@ for clip_item, (filename, time_str, desc, base_frames) in zip(video_items, valid
     elif "BOSS" in desc_upper or "GUN MAN" in desc_upper or "BIG FROG" in desc_upper:
         color = "Fuchsia"
         
-    # Add marker to the clip itself
-    clip_item.AddMarker(start_f, color, "Log Note", desc, 1, "")
+    # Add marker to the middle of the clip
+    clip_duration_frames = CLIP_DURATION_SECONDS * FPS
+    middle_f = start_f + (clip_duration_frames // 2)
+    clip_item.AddMarker(middle_f, color, "Log Note", desc, 1, "")
     
 print("Added color-coded metadata markers directly to the clips!")

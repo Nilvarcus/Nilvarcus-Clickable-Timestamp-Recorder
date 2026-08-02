@@ -50,11 +50,14 @@ class ResolveExportDialog(ctk.CTkToplevel):
             
         # Parse text content for timestamps
         # Format: *  **[1]**   **[00:00:10]** - Note text...
+        # AI analysis follows as:   > 🤖 Description text...
         timestamps = []
         lines = self.text_content.splitlines()
         current_clip = "UnknownClip.mp4" # fallback if no Filename: tag is present
         
-        for line in lines:
+        i = 0
+        while i < len(lines):
+            line = lines[i]
             # Check if this line starts a new clip
             file_match = re.search(r"## 0 - Filename:\s*(.+)", line)
             if file_match:
@@ -62,6 +65,7 @@ class ResolveExportDialog(ctk.CTkToplevel):
                 if not name.lower().endswith(".mp4") and not name.lower().endswith(".mkv"):
                     name += ".mp4"
                 current_clip = name
+                i += 1
                 continue
                 
             match = re.search(r"\*\s*\*\*\[\d+\]\*\*\s*\*\*\[(.*?)\]\*\*\s*-\s*(.*)", line)
@@ -74,13 +78,30 @@ class ResolveExportDialog(ctk.CTkToplevel):
                     note = note.split("![Screenshot]")[0].strip()
                     if note.endswith("📸 Screenshot →"):
                         note = note.replace("📸 Screenshot →", "").strip()
+                elif "![[" in note and "]]" in note:
+                    note = re.sub(r"!\[\[.*?\]\]", "", note).strip()
                 
-                if not note: 
+                # Check the next line for an AI analysis (> 🤖 / - 🤖 ...)
+                ai_description = ""
+                if i + 1 < len(lines):
+                    stripped = lines[i + 1].strip()
+                    ai_match = re.match(r"[-–—>]\s*🤖\s*(.*)", stripped)
+                    if ai_match:
+                        ai_description = ai_match.group(1).strip()
+                        i += 1  # Consume the AI analysis line
+                
+                if ai_description:
+                    if note:
+                        note = f"{note} | 🤖 {ai_description}"
+                    else:
+                        note = f"🤖 {ai_description}"
+                elif not note:
                     note = "Marker"
                 
                 # Escape strings safely
                 note = note.replace('"', '\\"').replace("'", "\\'")
                 timestamps.append((current_clip, time_str, note))
+            i += 1
                 
         if not timestamps:
             messagebox.showwarning("Warning", "No timestamps found in the current log.", parent=self)
@@ -127,7 +148,11 @@ class ResolveExportDialog(ctk.CTkToplevel):
         self.destroy()
 
 def open_resolve_export_dialog(app_instance):
-    text_content = app_instance.text_viewer.get("1.0", tk.END)
+    # Use get_text_only() if available (RichTextLog), otherwise fall back to get()
+    if hasattr(app_instance.text_viewer, 'get_text_only'):
+        text_content = app_instance.text_viewer.get_text_only()
+    else:
+        text_content = app_instance.text_viewer.get("1.0", tk.END)
     
     # Locate template file properly for both dev and PyInstaller environments
     base_path = os.path.dirname(os.path.abspath(__file__))

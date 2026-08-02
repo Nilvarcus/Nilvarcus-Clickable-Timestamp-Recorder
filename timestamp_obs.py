@@ -27,6 +27,7 @@ class OBSManager:
         self._req_client = None
         self._event_client = None
         self._connected = False
+        self._replay_buffer_active = False
         self._lock = threading.Lock()
 
         # GUI callbacks — set via register_callbacks()
@@ -57,6 +58,11 @@ class OBSManager:
     def is_connected(self):
         return self._connected
 
+    @property
+    def is_replay_buffer_active(self):
+        """True if the OBS replay buffer output is currently running."""
+        return self._replay_buffer_active
+
     def connect(self, host="localhost", port=4455, password=""):
         """Start a connection attempt in a background thread (non-blocking)."""
         threading.Thread(
@@ -79,6 +85,7 @@ class OBSManager:
         finally:
             with self._lock:
                 self._connected = False
+            self._replay_buffer_active = False
             self._fire(self._on_status_change, "disconnected")
 
     def test_connection(self, host, port, password):
@@ -99,10 +106,13 @@ class OBSManager:
         """
         Tell OBS to save the replay buffer.
         The log entry (SHORT marker) is handled by the GUI via save_short().
-        Returns True on success, False if not connected or on error.
+        Returns True on success, False if not connected, replay buffer not active, or on error.
         """
         if not self._connected or not self._req_client:
             print("[OBS] Not connected — cannot save replay buffer.")
+            return False
+        if not self._replay_buffer_active:
+            print("[OBS] Replay buffer not active — cannot save.")
             return False
         try:
             self._req_client.save_replay_buffer()
@@ -149,6 +159,7 @@ class OBSManager:
             ev.callback.register([
                 self.on_record_state_changed,
                 self.on_current_program_scene_changed,
+                self.on_replay_buffer_state_changed,
             ])
 
             with self._lock:
@@ -156,10 +167,20 @@ class OBSManager:
                 self._event_client = ev
                 self._connected = True
 
+            # Query initial replay buffer state
+            try:
+                status = req.get_replay_buffer_status()
+                self._replay_buffer_active = status.output_active
+                print(f"[OBS] Replay buffer initially {'active' if self._replay_buffer_active else 'inactive'}.")
+            except Exception as e:
+                print(f"[OBS] Could not query replay buffer state: {e}")
+                self._replay_buffer_active = False
+
             self._fire(self._on_status_change, "connected")
             print("[OBS] Connected successfully.")
 
         except Exception as e:
+            self._replay_buffer_active = False
             print(f"[OBS] Connection failed: {e}")
             with self._lock:
                 self._connected = False
@@ -199,6 +220,19 @@ class OBSManager:
                 self._fire(self._on_scene_change, scene_name)
             except Exception as e:
                 print(f"[OBS] Scene marker write error: {e}")
+
+    def on_replay_buffer_state_changed(self, data):
+        """
+        Track whether the replay buffer output is active.
+        Only treats OBS_WEBSOCKET_OUTPUT_STARTED as active to avoid
+        flickering during transitional states (STARTING, STOPPING).
+        """
+        state = data.output_state
+        print(f"[OBS] Replay buffer state: {state}")
+        if state == "OBS_WEBSOCKET_OUTPUT_STARTED":
+            self._replay_buffer_active = True
+        elif state in ("OBS_WEBSOCKET_OUTPUT_STOPPED", "OBS_WEBSOCKET_OUTPUT_STOPPING"):
+            self._replay_buffer_active = False
 
     # ── Internal: helpers ────────────────────────────────────────────────────
 
