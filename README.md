@@ -1,5 +1,7 @@
 # Nilvarcus Timestamp App
 
+![App Screenshot](newGUI-screenshot.png)
+
 A professional, streamlined Python application designed for content creators to efficiently mark and manage timestamps during video recordings. It features a crimson-on-black Material Design theme, global hotkeys with automatic admin elevation, direct OBS WebSocket integration, live HUD Overlays, configurable screenshot sizes with AI-powered Gemini analysis, and a zoomable text viewer.
 
 ## 🚀 Key Features
