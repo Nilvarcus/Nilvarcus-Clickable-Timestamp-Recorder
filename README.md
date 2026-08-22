@@ -1,63 +1,115 @@
-# Nilvarcus Timestamp App
+# Clickable Timestamp Recorder
 
-![App Screenshot](newGUI-screenshot.png)
+![Clickable Timestamp Recorder](Clickable-Timestamp-Recorder-App-Image.png)
 
-A professional, streamlined Python application designed for content creators to efficiently mark and manage timestamps during video recordings. It features a crimson-on-black Material Design theme, global hotkeys with automatic admin elevation, direct OBS WebSocket integration, live HUD Overlays, configurable screenshot sizes with AI-powered Gemini analysis, and a zoomable text viewer.
+A Windows-first desktop app that connects to OBS, starts its timer with OBS recording, and attaches microphone recordings to clickable timestamps.
 
-## 🚀 Key Features
+## Features
 
-*   **Comprehensive OBS Integration:** Connects seamlessly to OBS Studio via WebSocket. Features bi-directional recording sync (triggering one starts the other), automatic Scene Transition logging into your timeline, and Replay Buffer capture hooks.
-*   **Dynamic HUD Overlay:** A customizable, game-ready transparent overlay with a pulsing glowing border that dynamically shifts color based on backend state (Recording, Success, Error). Keeps your timer visible without cluttering the screen.
-*   **Synced Screenshots:** Instantly snap your primary gaming monitor natively without lag. Images auto-save into per-session subfolders (`Screenshots/<session>/`) as optimized JPEGs and inject Obsidian-compatible `![[wikilinks]]` alongside your elapsed time.
-*   **Screenshot Size Control:** Customize image dimensions directly from settings (choose between 720p, 1080p, or Original monitor resolution) to balance image clarity and disk space.
-*   **🤖 Gemini AI Screenshot Analysis:** Connect a free Google Gemini API key and press one button to send all session screenshots to Gemini. AI descriptions are auto-inserted as italic notes beneath each screenshot — already-analyzed shots are skipped automatically.
-*   **📏 Viewer Scale Control:** A zoom slider in Settings (60%–140%) lets you scale text and inline screenshot thumbnails in the main viewer — shrink to see more of your log, or zoom in for easier reading.
-*   **🔐 Automatic Admin Elevation:** The app auto-detects administrator privileges and requests elevation via UAC at launch. Global hotkeys work inside full-screen games without manual "Run as Administrator" every time.
-*   **Global Hotkeys:** Full hardware level support for `F13-F24` keys natively, bypassing UI focus. Maps perfectly onto a Stream Deck or Macro Pad. Mouse buttons (4, 5, middle) also bindable.
-*   **Advanced Markdown Formatting:** Generates clean, bolded, highly readable Markdown files built meticulously for previewing inside Obsidian or GitHub.
-*   **Configurable Environment:** Tabbed Settings window (General, OBS, AI, Keybinds). Set custom `Output Directories`, tweak screenshot resolutions, configure Gemini API keys, and adjust HUD opacities — all persisted across sessions.
+- Automatic OBS connection: a background watchdog connects whenever OBS is reachable, shows ● Waiting for OBS… while OBS is closed, and reconnects by itself after OBS restarts
+- OBS WebSocket connection and recording-state synchronization
+- Automatic replay-buffer logging: every OBS replay save becomes a violet 🎬 REPLAY entry tagged with the replay file's name (for example `replay- [21-08][17-44-10]`), placed inline between timestamps, with mic-note recording, tags, and a button to open the video
+- Timer starts/resets when OBS recording starts
+- Timer stops and locks timestamps when OBS recording stops
+- Built-in ▶/■ timer: run full timestamp sessions without OBS open
+- Timestamps grouped per OBS recording: each recording opens a numbered segment named after the OBS recording file (for example `[21-08][14-55-19]`), and timestamp numbering restarts at 001 in every segment
+- Project name and project-folder organization
+- Recent projects: clicking the project-name field opens a popup with the five most recent projects for one-click loading
+- Markdown project log with links to WAV recordings
+- Per-timestamp context screenshots: every new timestamp captures a small (720p-height) JPEG of the main monitor into the project's `Screenshots/` folder
+- JSON session metadata for reliable restoration
+- Clickable timestamp workflow: pending → recording → saved
+- Timestamp labels and a custom tag library: create, rename, recolor, and delete tags in the 🏷 tag manager (also reachable as ＋ New tag inside the timestamp edit dialog); renames and deletes propagate to the open project's timestamps, Markdown log, and session metadata
+- Timestamp deletion (log entry removed along with its WAV file and screenshot)
+- Manual timestamps from a typed time position (SS, MM:SS, or HH:MM:SS)
+- Microphone selection with Windows audio backend details
+- WAV recording and playback
+- Configurable global timestamp hotkey (keyboard keys or Mouse 4/5)
+- GUI timestamp button and global hotkey support
 
-## ⌨️ Default Keybinds
+## Project output
 
-| Action | Key | Description |
-| :--- | :--- | :--- |
-| **Create/Open File** | `F13` | Initialize a new session file in your target Output Folder. |
-| **Start Recording** | `F14` | Synchronize your stopwatch (and command OBS to start). |
-| **Mark Time** | `F15` | Instantly drop a bolded timestamp mark into the timeline. |
-| **Stop Recording** | `F16` | Finalize the log and stop OBS tracking. |
-| **Save Short** | `F18` | Saves your OBS Replay Buffer and drops a `## SHORT` marker. Only works when OBS is connected and the replay buffer is actively running. |
-| **Take Screenshot** | `F19` | Silently captures primary monitor and injects an Obsidian wikilink. |
-| **Analyze Screenshots** | `Unbound` | Send all session screenshots to Gemini AI for auto-descriptions. |
-| **Resolve Export** | `Unbound` | Generate DaVinci Resolve marker code from your timestamp log. |
-| **Custom Notes** | `F20-F24`| Inject your 5 pre-configured custom text markers natively. |
+After choosing an output folder and project name:
 
-## 🛠️ Installation & Setup
-
-### Prerequisites
-- **Python 3.x**
-
-### Dependencies
-```bash
-pip install customtkinter pynput obsws-python Pillow google-genai
+```text
+<output folder>/
+└── My Project/
+    ├── My Project.md
+    ├── session.json
+    ├── R01-001_00-12-34.wav
+    ├── R01-002_00-18-05.wav
+    └── Screenshots/
+        ├── R01-001_00-12-34.jpg
+        └── R01-002_00-18-05.jpg
 ```
 
-### OBS Setup
-To allow the app to command your recordings and listen for Scene Changes, ensure OBS WebSocket is enabled natively:
-`Tools → OBS WebSocket Settings → Enable WebSockets (Port 4455)`
+Completed recordings are linked from the Markdown file, which groups timestamps under one section per OBS recording. Each timestamp that captured a screenshot embeds it directly below its entry:
 
-### Running the App
+```markdown
+### [21-08][14-55-19]
+
+- 001 [00:12:34](R01-001_00-12-34.wav) — completed, 4.2s — "Good take" #kill #bug
+  - ![Screenshot](Screenshots/R01-001_00-12-34.jpg)
+- 002 00:18:05 — pending
+  - ![Screenshot](Screenshots/R01-002_00-18-05.jpg)
+```
+
+Labels are optional short notes, and tags come from the preset list in `keybinds.json`.
+
+## Requirements
+
+- Python 3.x on Windows
+- OBS Studio with WebSocket enabled
+- A microphone
+
+Install dependencies:
+
+```bash
+python -m pip install customtkinter pynput obsws-python sounddevice mss pillow pyinstaller
+```
+
+Enable OBS WebSocket from **Tools → WebSocket Server Settings**. The default connection is `localhost:4455`; host, port, and password are stored in `keybinds.json`.
+
+Connecting is automatic: while OBS is closed the header shows amber `● Waiting for OBS…` and the app retries every few seconds; once OBS starts it connects on its own, and if OBS exits mid-session it reconnects when OBS comes back. Clicking **Disconnect** pauses auto-connect until you click **Connect OBS** again.
+
+## Run from source
+
 ```bash
 python timestamp_gui.py
 ```
 
-## 💡 Usage Tips
+## Build the executable
 
-*   **Stream Deck Mapping:** Use your Elgato or macro software to map generic physical buttons to the `F13-F24` keys for a completely hands-free physical control deck while gaming.
-*   **Gemini API Key:** Grab a free API key from [Google AI Studio](https://aistudio.google.com/apikey), paste it in Settings → AI, then bind the "Analyze Screenshots" hotkey for one-press AI descriptions during sessions.
-*   **Admin Privileges:** The app auto-elevates at launch. If you want to suppress the UAC prompt, create a scheduled task or shortcut configured to "Run with highest privileges."
+```bash
+pyinstaller --clean --noconfirm timestamp_gui.spec
+```
 
-## 📄 License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+The executable is created at `dist/timestamp_gui_lite.exe`. The spec bundles the PortAudio runtime required by microphone recording and the mss/Pillow runtime used by timestamp screenshots.
 
----
-*Developed by Nilvarcus. Designed for creators, by a creator.*
+## Workflow
+
+1. Choose an output folder.
+2. Enter a project name and click **Set project**.
+3. Select a microphone. If **System default** does not work, choose the explicit input device shown with its index/backend.
+4. Change the timestamp hotkey if desired — click it, then press a key or Mouse 4/5 (Esc cancels).
+5. Start recording in OBS — the app connects and follows automatically — or click **▶ Start timer** to run a session without OBS.
+6. Press the timestamp hotkey or click **New timestamp**, or click **＋ Manual** to create one from a typed time. Each new timestamp also saves a small JPEG snapshot of your main monitor into the project's `Screenshots` folder.
+7. Click a pending timestamp to start microphone recording.
+8. Click the active timestamp to stop and save its WAV file.
+9. Click a saved timestamp to play or stop it.
+10. Use **✎** to add a label and tags to any timestamp, or **✕** to delete it (the WAV file and screenshot are deleted from disk too).
+11. Save a replay buffer in OBS (default hotkey) while connected: it is logged automatically as a 🎬 REPLAY entry at the current time. Click it to record a microphone note exactly like a timestamp, use **🎬** on the row to watch the replay video, and **✎**/**✕** to tag or remove it.
+
+Creating new timestamps requires a running timer — either an active OBS recording or the in-app **▶ Start timer** button. When no timer runs, existing timestamps stay fully usable: pending notes can still record audio and saved notes play back; only creating new entries waits for the next timer start.
+
+Replay saves are logged even while the timer is stopped (they attach to the most recent segment), but a project must be selected — without one the save is only announced in the status bar.
+
+Tip: click the **project name field** to reopen one of your five most recent projects instantly; typing a new name works as usual. If the app connects while OBS is already recording, it detects the active OBS recording and starts the timer after a project is selected; that segment's header falls back to `Recording N` until the recording stops and the real file name becomes known.
+
+## Out of scope
+
+This MVP intentionally does not include Gemini, DaVinci Resolve export, HUD overlays, video recording, in-app replay-buffer controls, transcription, or a database/server. (The app only *logs* OBS replay saves; it never starts/stops OBS outputs.) Per-timestamp screenshots were added by explicit product decision.
+
+## License
+
+MIT License; see [LICENSE](LICENSE).

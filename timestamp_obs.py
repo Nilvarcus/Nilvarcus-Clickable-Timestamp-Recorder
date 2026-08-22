@@ -1,245 +1,342 @@
-"""
-timestamp_obs.py — OBS Studio Integration for the Nilvarcus Timestamp App.
+"""Minimal OBS WebSocket integration for the Clickable Timestamp Recorder."""
 
-Handles:
-  - WebSocket connection management (obs-websocket v5 via obsws-python)
-  - Auto-sync: start/stop stopwatch when OBS recording starts/stops
-  - Scene markers: log scene transitions to the active timestamp file
-  - Replay buffer: trigger OBS save (log entry handled by GUI via save_short)
-
-Requires: pip install obsws-python
-OBS Setup: Tools → OBS WebSocket Settings → Enable (port 4455)
-"""
+from __future__ import annotations
 
 import threading
 
 
 class OBSManager:
-    """Self-contained OBS WebSocket manager.
+    """Connect to OBS and report the main recording output state.
 
-    All heavy logic (file writes, GUI updates) is delegated to the GUI layer
-    via registered callbacks, keeping this module free of tkinter dependencies.
+    An optional watchdog thread (``enable_auto_reconnect``) keeps the
+    connection alive across OBS restarts: while enabled it retries the
+    connection every few seconds until OBS's WebSocket server answers, and
+    detects a connection that died because OBS exited, so the app reconnects
+    automatically the next time OBS starts.
     """
 
-    def __init__(self, timestamp_manager):
-        self.timestamp_manager = timestamp_manager
-
+    def __init__(self):
         self._req_client = None
         self._event_client = None
         self._connected = False
-        self._replay_buffer_active = False
+        self._recording_active = False
+        self._replay_buffer_active: bool | None = None
         self._lock = threading.Lock()
 
-        # GUI callbacks — set via register_callbacks()
-        self._on_status_change = None      # (status_str: str) → None
-        self._on_scene_change = None       # (scene_name: str) → None
-        self._on_replay_saved = None       # () → None
-        self._on_recording_started = None  # () → None
-        self._on_recording_stopped = None  # () → None
+        self._on_status_change = None
+        self._on_recording_started = None
+        self._on_recording_stopped = None
+        self._on_replay_saved = None
 
-    # ── Public API ──────────────────────────────────────────────────────────
+        # Auto-reconnect watchdog state.
+        self._auto_reconnect_enabled = False
+        self._reconnect_interval = 5.0
+        self._connection_params = ("localhost", 4455, "")
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._attempt_in_progress = False
+        # Set when the user explicitly disconnects; the watchdog must not
+        # fight that decision until the next explicit connect.
+        self._user_suppressed = False
+        # Bumped by every teardown so a connection attempt that was in flight
+        # during a disconnect can detect that it went stale and stay silent.
+        self._epoch = 0
 
     def register_callbacks(
         self,
         on_status_change=None,
-        on_scene_change=None,
-        on_replay_saved=None,
         on_recording_started=None,
         on_recording_stopped=None,
-    ):
-        """Register GUI callbacks. All are optional."""
+        on_replay_saved=None,
+    ) -> None:
+        """Register optional callbacks; callbacks run from the OBS thread."""
         self._on_status_change = on_status_change
-        self._on_scene_change = on_scene_change
-        self._on_replay_saved = on_replay_saved
         self._on_recording_started = on_recording_started
         self._on_recording_stopped = on_recording_stopped
+        self._on_replay_saved = on_replay_saved
 
     @property
-    def is_connected(self):
+    def is_connected(self) -> bool:
         return self._connected
 
     @property
-    def is_replay_buffer_active(self):
-        """True if the OBS replay buffer output is currently running."""
+    def is_recording(self) -> bool:
+        return self._recording_active
+
+    @property
+    def replay_buffer_active(self) -> bool | None:
+        """OBS replay-buffer state learned at connect time.
+
+        True/False reflect the queried output state; None means the query
+        failed (or the client is disconnected), so callers cannot trust it.
+        """
         return self._replay_buffer_active
 
-    def connect(self, host="localhost", port=4455, password=""):
-        """Start a connection attempt in a background thread (non-blocking)."""
+    # ── Connection lifecycle ────────────────────────────────────────────────
+
+    def connect(self, host="localhost", port=4455, password="") -> None:
+        """Start a non-blocking OBS connection attempt.
+
+        An explicit connect clears the auto-reconnect suppression left by an
+        earlier explicit disconnect and refreshes the connection parameters
+        the watchdog uses for its own retries.
+        """
+        self._user_suppressed = False
+        self._connection_params = (str(host), int(port), str(password))
+        self._start_attempt(source="manual")
+
+    def disconnect(self) -> None:
+        """Disconnect both OBS WebSocket clients and pause auto-reconnect."""
+        # The user asked to be offline: the watchdog must not reconnect until
+        # they explicitly connect again.
+        self._user_suppressed = True
+        self._teardown_clients()
+        self._fire(self._on_status_change, "disconnected")
+
+    def shutdown(self) -> None:
+        """Stop the watchdog thread; used when the application closes."""
+        self._watchdog_stop.set()
+
+    def enable_auto_reconnect(
+        self, interval: float = 5.0, host="localhost", port=4455, password=""
+    ) -> None:
+        """Watch OBS availability and connect automatically whenever it appears.
+
+        Starts a daemon thread that attempts a connection immediately and
+        then roughly every ``interval`` seconds while disconnected. Once
+        connected it passively checks the socket so an OBS exit is noticed
+        and retried. Explicit ``disconnect()`` pauses the watchdog until the
+        next explicit ``connect()``.
+        """
+        self._reconnect_interval = max(1.0, float(interval))
+        self._connection_params = (str(host), int(port), str(password))
+        self._auto_reconnect_enabled = True
+        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+            self._watchdog_stop.clear()
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, name="obs-watchdog", daemon=True
+            )
+            self._watchdog_thread.start()
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.is_set():
+            self._watchdog_pass()
+            if self._watchdog_stop.wait(self._reconnect_interval):
+                break
+
+    def _watchdog_pass(self) -> None:
+        """One watchdog cycle: reconnect when down, verify liveness when up."""
+        if not self._auto_reconnect_enabled or self._user_suppressed:
+            return
+        if self._connected:
+            if self._event_socket_alive():
+                return
+            print("[OBS] Connection lost (OBS closed?) — waiting for OBS")
+            self._teardown_clients()
+            self._fire(self._on_status_change, "waiting")
+        if self._attempt_in_progress:
+            return
+        self._fire(self._on_status_change, "waiting")
+        self._start_attempt(source="watchdog")
+
+    def _event_socket_alive(self) -> bool:
+        """Passive liveness probe of the event client's underlying socket.
+
+        No WebSocket requests are issued (they could race concurrent calls);
+        the WebSocket object's ``connected`` flag simply reports whether the
+        connection is still up (websocket-client flips it to False when a
+        recv fails after the remote side closes, so an OBS exit is caught).
+
+        The client layout differs across obsws-python releases: >=1.x nests
+        it at ``event.base_client.ws`` while legacy builds exposed ``ws``
+        directly on the client. Anything unrecognizable fails OPEN — assume
+        alive — because failing closed here made the watchdog tear down and
+        reconnect a healthy connection every cycle, restarting the recording
+        segment each time (the v2.6.1 churn bug).
+        """
+        with self._lock:
+            event = self._event_client
+        if event is None:
+            return False
+        try:
+            ws = getattr(getattr(event, "base_client", None), "ws", None)
+            if ws is None:
+                ws = getattr(event, "ws", None)
+            if ws is None:
+                print(
+                    "[OBS] Event client has an unrecognized layout; "
+                    "assuming the connection is alive"
+                )
+                return True
+            return bool(getattr(ws, "connected", True))
+        except Exception:
+            return True
+
+    def _teardown_clients(self) -> None:
+        """Drop both WebSocket clients and reset state without touching the
+        auto-reconnect suppression flag."""
+        with self._lock:
+            self._epoch += 1
+            event = self._event_client
+            req = self._req_client
+            self._event_client = None
+            self._req_client = None
+        for client in (event, req):
+            if client is None:
+                continue
+            try:
+                client.disconnect()
+            except Exception as exc:
+                print(f"[OBS] Disconnect error: {exc}")
+        with self._lock:
+            self._connected = False
+            self._recording_active = False
+            self._replay_buffer_active = None
+
+    def _start_attempt(self, source: str) -> None:
+        """Spawn one connection attempt unless another one is still running."""
+        if self._attempt_in_progress:
+            return
+        self._attempt_in_progress = True
+        host, port, password = self._connection_params
+        with self._lock:
+            self._epoch += 1
+            epoch = self._epoch
         threading.Thread(
             target=self._connect_thread,
-            args=(host, port, password),
+            args=(host, port, password, epoch, source),
             daemon=True,
         ).start()
 
-    def disconnect(self):
-        """Cleanly disconnect from OBS WebSocket."""
+    def _connect_thread(self, host, port, password, epoch: int, source: str) -> None:
         try:
-            if self._event_client:
-                self._event_client.disconnect()
-                self._event_client = None
-            if self._req_client:
-                self._req_client.disconnect()
-                self._req_client = None
-        except Exception as e:
-            print(f"[OBS] Disconnect error: {e}")
-        finally:
-            with self._lock:
-                self._connected = False
-            self._replay_buffer_active = False
-            self._fire(self._on_status_change, "disconnected")
-
-    def test_connection(self, host, port, password):
-        """
-        Test a connection synchronously.
-        Returns (True, 'OBS X.Y.Z') on success or (False, 'error message').
-        """
-        try:
-            import obsws_python as obs
-            client = obs.ReqClient(host=host, port=int(port), password=password, timeout=3)
-            version = client.get_version()
-            client.disconnect()
-            return True, f"OBS {version.obs_version}"
-        except Exception as e:
-            return False, str(e)
-
-    def save_replay_buffer(self):
-        """
-        Tell OBS to save the replay buffer.
-        The log entry (SHORT marker) is handled by the GUI via save_short().
-        Returns True on success, False if not connected, replay buffer not active, or on error.
-        """
-        if not self._connected or not self._req_client:
-            print("[OBS] Not connected — cannot save replay buffer.")
-            return False
-        if not self._replay_buffer_active:
-            print("[OBS] Replay buffer not active — cannot save.")
-            return False
-        try:
-            self._req_client.save_replay_buffer()
-            self._fire(self._on_replay_saved)
-            return True
-        except Exception as e:
-            print(f"[OBS] Replay buffer error: {e}")
-            return False
-
-    def start_obs_recording(self):
-        """Command OBS to start recording."""
-        if not self._connected or not self._req_client:
-            return False
-        try:
-            self._req_client.start_record()
-            return True
-        except Exception as e:
-            print(f"[OBS] Start recording error: {e}")
-            return False
-
-    def stop_obs_recording(self):
-        """Command OBS to stop recording."""
-        if not self._connected or not self._req_client:
-            return False
-        try:
-            self._req_client.stop_record()
-            return True
-        except Exception as e:
-            print(f"[OBS] Stop recording error: {e}")
-            return False
-
-    # ── Internal: connection ─────────────────────────────────────────────────
-
-    def _connect_thread(self, host, port, password):
-        self._fire(self._on_status_change, "connecting")
-        try:
+            self._fire(
+                self._on_status_change,
+                "connecting" if source == "manual" else "waiting",
+            )
             import obsws_python as obs
 
-            # Request client — used to send commands to OBS
-            req = obs.ReqClient(host=host, port=int(port), password=password, timeout=5)
-
-            # Event client — listens for OBS events
-            ev = obs.EventClient(host=host, port=int(port), password=password)
-            ev.callback.register([
-                self.on_record_state_changed,
-                self.on_current_program_scene_changed,
-                self.on_replay_buffer_state_changed,
-            ])
-
+            req = obs.ReqClient(
+                host=host, port=int(port), password=password, timeout=5
+            )
+            # Publish the request client before event handlers can fire so
+            # the replay-path fallback query always has a client to use. A
+            # disconnect that happened mid-attempt invalidates this one.
             with self._lock:
+                if epoch != self._epoch:
+                    req.disconnect()
+                    return
                 self._req_client = req
-                self._event_client = ev
+            event = obs.EventClient(
+                host=host, port=int(port), password=password
+            )
+            event.callback.register(
+                [self.on_record_state_changed, self.on_replay_buffer_saved]
+            )
+
+            with self._lock:
+                if epoch != self._epoch:
+                    # Stale attempt: a disconnect/teardown happened while we
+                    # were connecting. Quietly drop the fresh clients.
+                    try:
+                        event.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        req.disconnect()
+                    except Exception:
+                        pass
+                    return
+                self._event_client = event
                 self._connected = True
 
-            # Query initial replay buffer state
             try:
-                status = req.get_replay_buffer_status()
-                self._replay_buffer_active = status.output_active
-                print(f"[OBS] Replay buffer initially {'active' if self._replay_buffer_active else 'inactive'}.")
-            except Exception as e:
-                print(f"[OBS] Could not query replay buffer state: {e}")
-                self._replay_buffer_active = False
+                record_status = req.get_record_status()
+                self._recording_active = bool(record_status.output_active)
+            except Exception as exc:
+                print(f"[OBS] Could not query recording state: {exc}")
+                self._recording_active = False
+
+            try:
+                replay_status = req.get_replay_buffer_status()
+                self._replay_buffer_active = bool(replay_status.output_active)
+            except Exception as exc:
+                print(f"[OBS] Could not query replay buffer state: {exc}")
+                self._replay_buffer_active = None
 
             self._fire(self._on_status_change, "connected")
+            if self._recording_active:
+                self._fire(self._on_recording_started)
             print("[OBS] Connected successfully.")
-
-        except Exception as e:
-            self._replay_buffer_active = False
-            print(f"[OBS] Connection failed: {e}")
+        except Exception as exc:
+            print(f"[OBS] Connection failed: {exc}")
             with self._lock:
                 self._connected = False
-            self._fire(self._on_status_change, f"error:{e}")
+                self._recording_active = False
+                self._replay_buffer_active = None
+            if source == "manual":
+                # A user-initiated attempt deserves the visible error.
+                self._fire(self._on_status_change, f"error:{exc}")
+            else:
+                # Watchdog retries stay quiet in the GUI; the amber
+                # "waiting" indicator covers them.
+                self._fire(self._on_status_change, "waiting")
+        finally:
+            self._attempt_in_progress = False
 
-    # ── Internal: OBS event handlers ─────────────────────────────────────────
+    # ── OBS events ──────────────────────────────────────────────────────────
 
-    def on_record_state_changed(self, data):
+    def on_record_state_changed(self, data) -> None:
+        """Forward main OBS recording transitions to the registered callbacks.
+
+        The WebSocket protocol populates ``output_path`` only for the STARTED
+        and STOPPED states; it is the file path of the recording, which the
+        GUI uses as the timestamp segment name. Callbacks receive the path or
+        None when the event did not carry one.
         """
-        Fires callbacks when OBS recording starts or stops.
-        All actual start/stop logic runs on the GUI main thread via the callback.
-        No direct calls to TimestampManager here — that avoids threading issues.
-        """
-        state = data.output_state
+        state = getattr(data, "output_state", "")
+        output_path = getattr(data, "output_path", None)
         print(f"[OBS] Record state: {state}")
 
         if state == "OBS_WEBSOCKET_OUTPUT_STARTED":
-            self._fire(self._on_recording_started)
+            if not self._recording_active:
+                self._recording_active = True
+                self._fire(self._on_recording_started, output_path)
+        elif state == "OBS_WEBSOCKET_OUTPUT_STOPPED":
+            # Wait for STOPPED rather than STOPPING so the final file path is
+            # available for renaming the segment that was just recorded.
+            if self._recording_active:
+                self._recording_active = False
+                self._fire(self._on_recording_stopped, output_path)
 
-        elif state in ("OBS_WEBSOCKET_OUTPUT_STOPPED", "OBS_WEBSOCKET_OUTPUT_STOPPING"):
-            self._fire(self._on_recording_stopped)
+    def on_replay_buffer_saved(self, data) -> None:
+        """Forward OBS replay-buffer saves to the registered callback.
 
-    def on_current_program_scene_changed(self, data):
+        The v5 ReplayBufferSaved event carries savedReplayPath; if a host
+        omits it, fall back once to GetLastReplayBufferReplay. The callback
+        always fires: with the path when it could be resolved, else None so
+        the GUI can explain why no entry was created.
         """
-        Writes a scene marker to the log file, then notifies the GUI to refresh.
-        File I/O is safe from this thread; GUI refresh goes via callback.
-        """
-        scene_name = data.scene_name
-        tm = self.timestamp_manager
-
-        # Only log if a recording session is active
-        if tm.current_file_path and tm.stopwatch_running:
-            line = f"\n📺  **Scene →** {scene_name}"
+        path = getattr(data, "saved_replay_path", None)
+        if not path:
             try:
-                with open(tm.current_file_path, "a", encoding="utf-8") as f:
-                    f.write(line)
-                self._fire(self._on_scene_change, scene_name)
-            except Exception as e:
-                print(f"[OBS] Scene marker write error: {e}")
+                with self._lock:
+                    req = self._req_client
+                if req is not None:
+                    path = req.get_last_replay_buffer_replay().saved_replay_path
+            except Exception as exc:
+                print(f"[OBS] Could not resolve saved replay path: {exc}")
+        if path:
+            print(f"[OBS] Replay buffer saved: {path}")
+            self._fire(self._on_replay_saved, str(path))
+        else:
+            print("[OBS] ReplayBufferSaved arrived without a resolvable path")
+            self._fire(self._on_replay_saved, None)
 
-    def on_replay_buffer_state_changed(self, data):
-        """
-        Track whether the replay buffer output is active.
-        Only treats OBS_WEBSOCKET_OUTPUT_STARTED as active to avoid
-        flickering during transitional states (STARTING, STOPPING).
-        """
-        state = data.output_state
-        print(f"[OBS] Replay buffer state: {state}")
-        if state == "OBS_WEBSOCKET_OUTPUT_STARTED":
-            self._replay_buffer_active = True
-        elif state in ("OBS_WEBSOCKET_OUTPUT_STOPPED", "OBS_WEBSOCKET_OUTPUT_STOPPING"):
-            self._replay_buffer_active = False
-
-    # ── Internal: helpers ────────────────────────────────────────────────────
-
-    def _fire(self, callback, *args):
-        """Safely invoke a callback (ignores None)."""
+    @staticmethod
+    def _fire(callback, *args) -> None:
         if callback:
             try:
                 callback(*args)
-            except Exception as e:
-                print(f"[OBS] Callback error: {e}")
+            except Exception as exc:
+                print(f"[OBS] Callback error: {exc}")
