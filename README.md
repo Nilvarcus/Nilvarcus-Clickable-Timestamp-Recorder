@@ -6,26 +6,18 @@ A Windows-first desktop app that connects to OBS, starts its timer with OBS reco
 
 ## Features
 
-- Automatic OBS connection: a background watchdog connects whenever OBS is reachable, shows ● Waiting for OBS… while OBS is closed, and reconnects by itself after OBS restarts
-- OBS WebSocket connection and recording-state synchronization
-- Automatic replay-buffer logging: every OBS replay save becomes a violet 🎬 REPLAY entry tagged with the replay file's name (for example `replay- [21-08][17-44-10]`), placed inline between timestamps, with mic-note recording, tags, and a button to open the video
-- Timer starts/resets when OBS recording starts
-- Timer stops and locks timestamps when OBS recording stops
-- Built-in ▶/■ timer: run full timestamp sessions without OBS open
-- Timestamps grouped per OBS recording: each recording opens a numbered segment named after the OBS recording file (for example `[21-08][14-55-19]`), and timestamp numbering restarts at 001 in every segment
-- Project name and project-folder organization
-- Recent projects: clicking the project-name field opens a popup with the five most recent projects for one-click loading
-- Markdown project log with links to WAV recordings
-- Per-timestamp context screenshots: every new timestamp captures a small (720p-height) JPEG of the main monitor into the project's `Screenshots/` folder
-- JSON session metadata for reliable restoration
-- Clickable timestamp workflow: pending → recording → saved
-- Timestamp labels and a custom tag library: create, rename, recolor, and delete tags in the 🏷 tag manager (also reachable as ＋ New tag inside the timestamp edit dialog); renames and deletes propagate to the open project's timestamps, Markdown log, and session metadata
-- Timestamp deletion (log entry removed along with its WAV file and screenshot)
-- Manual timestamps from a typed time position (SS, MM:SS, or HH:MM:SS)
-- Microphone selection with Windows audio backend details
-- WAV recording and playback
-- Configurable global timestamp hotkey (keyboard keys or Mouse 4/5)
-- GUI timestamp button and global hotkey support
+- OBS WebSocket auto-connect with recording sync
+- ▶/■ Built-in timer (works without OBS)
+- Clickable timestamp workflow: pending → recording → playback
+- Per-recording segment groups with restarting numbering
+- Microphone WAV recording and playback
+- Per-timestamp 720p screenshots
+- Labels, tag library, and tag propagation
+- Replay-buffer logging (passive)
+- Recent projects for one-click switching
+- Markdown project log with media links
+- Configurable global hotkey (keyboard & mouse)
+- Manual timestamps from typed time
 
 ## Project output
 
