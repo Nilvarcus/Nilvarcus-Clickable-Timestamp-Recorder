@@ -17,8 +17,8 @@ python timestamp_gui.py
 ## Tests and checks
 
 ```bash
-python -m unittest -v
-python -m py_compile timestamp_gui.py timestamp_audio.py timestamp_obs.py timestamp_screenshot.py test_timestamp_audio.py
+python -m unittest discover -s tests -v
+python -m py_compile timestamp_gui.py timestamp_audio.py timestamp_obs.py timestamp_screenshot.py
 ```
 
 The tests are dependency-light and cover timestamp formatting, safe filenames, persistence, Markdown links, interrupted sessions, device-query errors, tag-library helpers (`sanitize_tag_definitions`, `rename_tag`, `remove_tag`), screenshot path/Markdown rules, and capture scaling. Real microphone, OBS, GUI, and screen-capture smoke tests still require Windows hardware/software; the real-capture test skips automatically when mss/Pillow are missing.

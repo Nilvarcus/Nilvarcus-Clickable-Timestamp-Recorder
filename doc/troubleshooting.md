@@ -4,10 +4,10 @@
 
 - Confirm OBS is running. The header shows amber `● Waiting for OBS…` while the app retries, and it connects on its own once OBS starts — no button press needed.
 - Enable the OBS WebSocket server.
-- Check host, port, and password in `keybinds.json`. A wrong password keeps the app in `● Waiting for OBS…` (retry details are printed to the console); with auto-connect off, a manual attempt shows the error instead.
+- Check host, port, and password via the header ⚙ button (or in `keybinds.json`). A wrong password now shows a red `● OBS auth failed` header and a status-bar hint ("OBS refused the password — click ⚙ to edit") instead of hiding behind the amber dot; it is de-duplicated so repeated retries stay quiet.
 - Confirm the app status changes from connecting to connected.
 - If you clicked **Disconnect**, auto-connect stays paused on purpose until you click **Connect OBS** again.
-- Restart the app after changing OBS WebSocket settings.
+- Changing settings via ⚙ reconnects immediately; otherwise restart the app after hand-editing `keybinds.json`.
 
 ## Timer does not start
 
@@ -33,7 +33,8 @@ Creating timestamps needs a running timer: an active OBS recording **or** the in
 
 - **▶ Start timer** and OBS recording share the same session timer: whichever comes first opens segment 1, and each later start opens the next numbered segment.
 - Stopping the timer (in-app or via OBS stop) locks new-timestamp creation until a timer starts again.
-- Existing timestamps stay clickable while locked: pending rows record notes, completed rows play back.
+- While the manual ▶ timer runs, ⏸ Pause freezes the clock and timestamp times for the same segment until ▶ Resume (disabled while OBS records; segment wall duration still includes the paused time and pause does not survive a restart).
+- Existing timestamps stay clickable while locked/paused: pending rows record notes (blocked only while paused for new creation), completed rows play back.
 
 ## Global timestamp hotkey does not work
 
@@ -56,6 +57,16 @@ pyinstaller --clean --noconfirm timestamp_gui.spec
 ```
 
 The spec bundles the PortAudio runtime required by `sounddevice`.
+
+## "No microphone input detected" stops my recording
+
+That is the silence watchdog doing its job: the 🎤 level bar beside the status bar never moved because the selected input delivered (almost) no signal for the whole take, so the app discarded the completely silent capture instead of saving an empty file. Any detected input disarms the watchdog for the rest of that take — pausing mid-recording never deletes audio you already recorded; an aborted retake on an already-saved timestamp keeps that previous audio and stays green. Check, in order:
+
+- The right device is selected in the microphone dropdown (a disconnected headset often lingers as a stale entry).
+- The mic is not muted in Windows or on the device itself, and its input level is not set to 0.
+- Windows microphone privacy permissions allow desktop apps.
+- If you work in a very quiet room or speak softly, lower `mic_settings.silence_threshold` in `keybinds.json` (default `250.0`); raise it if background noise keeps truly dead recordings alive.
+- To get more grace time before the auto-stop, raise `mic_settings.silence_timeout` (default `5.0` seconds); a very large value effectively disables the feature while keeping the level meter.
 
 ## Recording fails
 
@@ -81,17 +92,21 @@ The spec bundles the mss/Pillow runtime used for captures.
 
 ## Project files are missing
 
-A project folder contains `<Project Name>.md`, `session.json`, WAV files, and a `Screenshots` folder with per-timestamp JPEGs. Keep the folder together when moving it so Markdown relative links and embedded images remain valid. If `session.json` is malformed, restore it from a backup; it is the machine-readable source of truth.
+A project folder contains `<Project Name>.md`, `session.json`, `session.backup.json` (one-generation copy made before each save), WAV files, and a `Screenshots` folder with per-timestamp JPEGs. Keep the folder together when moving it so Markdown relative links and embedded images remain valid. If `session.json` is malformed, restore it from `session.backup.json`; `session.json` is the machine-readable source of truth.
 
 ## OBS stops while a note is recording
 
-The app automatically finalizes the active microphone note, saves its WAV file, stops the timer, and locks timestamp creation.
+The app automatically finalizes the active microphone note, saves its WAV file, stops the timer, and locks timestamp creation. This only happens when a *live* connection actually drops (or OBS stops recording); while OBS is simply not running at all, ▶ timer sessions and recordings run indefinitely — that was a bug in earlier versions where every reconnect retry pass cut them off after a few seconds.
+
+## Deleting a timestamp left files behind
+
+- Deleting a timestamp now moves its WAV takes and screenshot to the Recycle Bin; if a file is locked the entry is kept and the status bar tells you which file blocked it so you can close the program holding it and retry. Paths outside the project folder are reported but do not block deletion.
 
 ## Diagnostic commands
 
 ```bash
 python --version
 python -m pip show customtkinter pynput obsws-python sounddevice
-python -m unittest -v
-python -m py_compile timestamp_gui.py timestamp_audio.py timestamp_obs.py test_timestamp_audio.py
+python -m unittest discover -s tests -v
+python -m py_compile timestamp_gui.py timestamp_audio.py timestamp_obs.py timestamp_screenshot.py
 ```

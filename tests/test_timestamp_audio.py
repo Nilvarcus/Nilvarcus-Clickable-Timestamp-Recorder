@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -17,20 +19,25 @@ from timestamp_audio import (
     AudioError,
     AudioRecorder,
     DEFAULT_TAG_COLOR,
+    MIC_LEVEL_CLAMP_RMS,
     RecordingInfo,
     SESSION_FILENAME,
+    SilenceMonitor,
     TAG_NAME_MAX_LENGTH,
+    TimestampEntry,
     TimestampSession,
     clean_label,
     clean_tags,
     format_elapsed,
     format_elapsed_display,
+    normalize_level,
     normalize_tag_name,
     parse_time_input,
     read_project_stats,
     remove_recent_project,
     replay_display_name,
     replay_file_uri,
+    rms_int16,
     sanitize_project_name,
     sanitize_recent_projects,
     sanitize_tag_definitions,
@@ -143,6 +150,32 @@ class TimestampSessionTests(unittest.TestCase):
             restored = TimestampSession(folder)
             self.assertEqual(restored.entries[0].status, "pending")
             self.assertIsNone(restored.entries[0].error)
+
+    def test_reset_for_retry_returns_taken_entry_to_completed(self):
+        """An aborted re-record/quick take keeps its previous active audio."""
+        with tempfile.TemporaryDirectory() as folder:
+            session = TimestampSession(folder, load_existing=False)
+            entry = session.create_timestamp(10)
+            audio_path = os.path.join(folder, "001_00-00-10.wav")
+            session.mark_completed(entry, audio_path, 2.5)
+
+            session.mark_recording(entry)
+            session.reset_for_retry(entry)
+            self.assertEqual(entry.status, "completed")
+            self.assertEqual(entry.audio_file, "001_00-00-10.wav")
+            self.assertEqual(entry.duration_seconds, 2.5)
+            self.assertEqual(len(entry.takes), 1)
+
+    def test_reset_for_retry_keeps_plain_entries_pending(self):
+        """Entries without takes still fall back to pending after an abort."""
+        with tempfile.TemporaryDirectory() as folder:
+            session = TimestampSession(folder, load_existing=False)
+            entry = session.create_timestamp(4)
+            session.mark_recording(entry)
+
+            session.reset_for_retry(entry)
+            self.assertEqual(entry.status, "pending")
+            self.assertIsNone(entry.error)
 
     def test_metadata_is_valid_json(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -267,14 +300,17 @@ class TimestampAnnotationTests(unittest.TestCase):
             session = TimestampSession(folder, load_existing=False)
             entry = session.create_timestamp(5)
             blocked = os.path.join(folder, "blocked.jpg")
-            os.makedirs(blocked)  # a directory forces OSError on remove
+            open(blocked, "w").close()
             entry.screenshot_file = "blocked.jpg"
 
-            _, problems = session.remove_entry(entry.id)
+            # Simulate a locked file that send2trash cannot recycle.
+            with patch("send2trash.send2trash", side_effect=OSError("file is locked")):
+                _, problems = session.remove_entry(entry.id)
             self.assertEqual(len(problems), 1)
             self.assertIn("blocked.jpg", problems[0])
-            self.assertTrue(os.path.isdir(blocked))
-            self.assertEqual(len(session.entries), 0)
+            self.assertTrue(os.path.isfile(blocked))
+            # Recycle failure blocks deletion so the user can retry after freeing the file.
+            self.assertEqual(len(session.entries), 1)
 
     def test_remove_entry_leaves_out_of_project_paths_alone(self):
         with tempfile.TemporaryDirectory() as outer:
@@ -565,6 +601,72 @@ class RecordingSegmentTests(unittest.TestCase):
                 markdown = handle.read()
             self.assertIn("### [21-08][15-00-00]", markdown)
             self.assertNotIn("### Recording 1", markdown)
+
+    def test_recording_path_persists_and_legacy_files_load_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+
+            restored = TimestampSession(folder)
+            self.assertEqual(
+                restored.recordings[0].path,
+                "E:/rec/[21-08][10-00-00].mp4",
+            )
+
+        # Recordings stored by older app versions carry no path key.
+        legacy = RecordingInfo.from_dict(
+            {"number": 1, "name": "[21-08][10-00-00]", "started_at": 1000.0}
+        )
+        self.assertIsNone(legacy.path)
+
+    def test_set_recording_path_updates_confirms_and_ignores_safely(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+
+            # Unknown segment numbers and empty paths are safe no-ops.
+            session.set_recording_path(99, "E:/rec/other.mp4")
+            session.set_recording_path(1, "   ")
+            self.assertEqual(len(session.recordings), 1)
+            self.assertIsNone(session.recordings[0].path)
+
+            # Start event backfills; stop event with the same path is a
+            # no-op save-wise but keeps the value.
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            self.assertEqual(
+                session.recordings[0].path,
+                "E:/rec/[21-08][10-00-00].mp4",
+            )
+
+    def test_markdown_footage_link_only_when_segment_has_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            linked = session.create_timestamp(10)
+            session.stop_timer()
+            session.recordings[0].path = "E:/rec/[21-08][10-00-00].mp4"
+            session.start_timer("[21-08][11-00-00]")
+            plain = session.create_timestamp(20)
+            session.stop_timer()
+            session.save()
+
+            with open(os.path.join(folder, "My Project.md"), encoding="utf-8") as handle:
+                markdown = handle.read()
+
+            header_at = markdown.index("### [21-08][10-00-00]")
+            footage_at = markdown.index(
+                "- Footage: [[21-08][10-00-00].mp4](file:///", header_at
+            )
+            entry_at = markdown.index(f"{linked.recording_index:03d}", header_at)
+            self.assertLess(header_at, footage_at)
+            self.assertLess(footage_at, entry_at)
+            # The second segment has no path: no Footage line under it.
+            second_header_at = markdown.index("### [21-08][11-00-00]")
+            second_section = markdown[second_header_at:]
+            self.assertNotIn("Footage:", second_section)
+            self.assertIn(f"{plain.recording_index:03d}", second_section)
 
 
 class ScreenshotSupportTests(unittest.TestCase):
@@ -1308,6 +1410,298 @@ class ReplayEntryTests(unittest.TestCase):
         )
         self.assertEqual(replay_display_name(None), "Unknown replay")
         self.assertEqual(replay_display_name(""), "Unknown replay")
+
+
+class AudioTakeTests(unittest.TestCase):
+    """Re-recordable takes: registration, activation, removal, persistence."""
+
+    def _session(self, folder):
+        return TimestampSession(folder, "Takes Project", load_existing=False)
+
+    def _complete(self, session, entry, name, duration):
+        path = os.path.join(session.output_dir, name)
+        with open(path, "wb") as handle:
+            handle.write(b"RIFF")
+        session.mark_completed(entry, path, duration)
+        return path
+
+    def test_mark_completed_registers_active_take(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            self._complete(session, entry, "001_00-00-10.wav", 2.5)
+
+            self.assertEqual(len(entry.takes), 1)
+            self.assertEqual(entry.status, "completed")
+            self.assertEqual(entry.audio_file, "001_00-00-10.wav")
+            self.assertEqual(entry.duration_seconds, 2.5)
+            self.assertEqual(entry.takes[0]["file"], "001_00-00-10.wav")
+
+    def test_rerecord_appends_new_active_take(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            self._complete(session, entry, "001_00-00-10.wav", 2.5)
+            self._complete(session, entry, "001_00-00-10_2.wav", 7.0)
+
+            self.assertEqual(len(entry.takes), 2)
+            self.assertEqual(entry.audio_file, "001_00-00-10_2.wav")
+            self.assertEqual(entry.duration_seconds, 7.0)
+
+    def test_mark_completed_dedupes_same_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            path = os.path.join(folder, "001_00-00-10.wav")
+            session.mark_completed(entry, path, 2.5)
+            session.mark_completed(entry, path, 4.0)
+
+            self.assertEqual(len(entry.takes), 1)
+            self.assertEqual(entry.duration_seconds, 4.0)
+
+    def test_set_active_take_switches_headline_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            first = self._complete(session, entry, "001_00-00-10.wav", 2.5)
+            second = self._complete(session, entry, "001_00-00-10_2.wav", 7.0)
+
+            session.set_active_take(entry, 0)
+            self.assertEqual(entry.audio_file, os.path.relpath(first, folder))
+            self.assertEqual(entry.duration_seconds, 2.5)
+            self.assertTrue(os.path.isfile(second))  # old take stays on disk
+
+    def test_set_active_take_rejects_bad_index_and_missing_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            self._complete(session, entry, "001_00-00-10.wav", 2.5)
+
+            with self.assertRaises(IndexError):
+                session.set_active_take(entry, 5)
+            os.remove(os.path.join(folder, "001_00-00-10.wav"))
+            with self.assertRaises(FileNotFoundError):
+                session.set_active_take(entry, 0)
+
+    def test_remove_take_deletes_file_and_promotes_newest_remaining(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            first = self._complete(session, entry, "001_00-00-10.wav", 2.5)
+            second = self._complete(session, entry, "001_00-00-10_2.wav", 7.0)
+
+            removed = session.remove_take(entry, 1)
+
+            self.assertFalse(os.path.exists(second))
+            self.assertEqual(removed["file"], "001_00-00-10_2.wav")
+            self.assertEqual(entry.audio_file, os.path.relpath(first, folder))
+            self.assertEqual(entry.duration_seconds, 2.5)
+            self.assertEqual(entry.status, "completed")
+            self.assertEqual(len(entry.takes), 1)
+
+    def test_remove_last_take_resets_entry_to_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            only = self._complete(session, entry, "001_00-00-10.wav", 2.5)
+
+            session.remove_take(entry, 0)
+
+            self.assertFalse(os.path.exists(only))
+            self.assertIsNone(entry.audio_file)
+            self.assertIsNone(entry.duration_seconds)
+            self.assertEqual(entry.status, "pending")
+            self.assertEqual(entry.takes, [])
+
+    def test_remove_take_blocked_while_recording(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            self._complete(session, entry, "001_00-00-10.wav", 2.5)
+            entry.status = "recording"
+
+            with self.assertRaises(ValueError):
+                session.remove_take(entry, 0)
+
+    def test_remove_entry_cleans_all_take_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            first = self._complete(session, entry, "001_00-00-10.wav", 2.5)
+            second = self._complete(session, entry, "001_00-00-10_2.wav", 7.0)
+
+            _, problems = session.remove_entry(entry.id)
+
+            self.assertEqual(problems, [])
+            self.assertFalse(os.path.exists(first))
+            self.assertFalse(os.path.exists(second))
+
+    def test_markdown_lists_alternate_takes_not_the_active_one(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project_folder = os.path.join(folder, "Takes Project")
+            session = TimestampSession(
+                project_folder, "Takes Project", load_existing=False
+            )
+            entry = session.create_timestamp(10)
+            session.mark_completed(
+                entry, os.path.join(project_folder, "001_00-00-10.wav"), 2.5
+            )
+            session.mark_completed(
+                entry, os.path.join(project_folder, "001_00-00-10_2.wav"), 7.0
+            )
+
+            with open(
+                os.path.join(project_folder, "Takes Project.md"), encoding="utf-8"
+            ) as handle:
+                markdown = handle.read()
+
+            self.assertIn("[00:00:10](001_00-00-10_2.wav)", markdown)
+            self.assertIn("Take 1: [001_00-00-10.wav](001_00-00-10.wav) (2.5s)", markdown)
+            self.assertNotIn("[001_00-00-10_2.wav](001_00-00-10_2.wav) (7.0s)", markdown)
+
+    def test_session_roundtrip_persists_takes_and_active_pointer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            self._complete(session, entry, "001_00-00-10.wav", 2.5)
+            self._complete(session, entry, "001_00-00-10_2.wav", 7.0)
+
+            reloaded = TimestampSession(folder, "Takes Project")
+            loaded = reloaded.get(entry.id)
+
+            self.assertEqual(len(loaded.takes), 2)
+            self.assertEqual(loaded.audio_file, "001_00-00-10_2.wav")
+            self.assertEqual(loaded.takes[0]["file"], "001_00-00-10.wav")
+            self.assertEqual(loaded.takes[1]["duration_seconds"], 7.0)
+
+
+class TakeCompatTests(unittest.TestCase):
+    """Old session.json files must keep loading when takes did not exist."""
+
+    def test_from_dict_synthesizes_take_for_legacy_audio(self):
+        entry = TimestampEntry.from_dict(
+            {
+                "id": 3,
+                "elapsed_seconds": 12,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "status": "completed",
+                "audio_file": "001_00-00-12.wav",
+                "duration_seconds": 4.0,
+            }
+        )
+
+        self.assertEqual(len(entry.takes), 1)
+        self.assertEqual(entry.takes[0]["file"], "001_00-00-12.wav")
+        self.assertEqual(entry.takes[0]["duration_seconds"], 4.0)
+
+    def test_from_dict_parses_takes_and_skips_garbage(self):
+        entry = TimestampEntry.from_dict(
+            {
+                "id": 4,
+                "elapsed_seconds": 12,
+                "created_at": "x",
+                "takes": [
+                    {"file": "a.wav", "duration_seconds": 1.5, "created_at": "c1"},
+                    {"file": "", "duration_seconds": 9},
+                    "not-a-dict",
+                    None,
+                    {"duration_seconds": 3},
+                ],
+            }
+        )
+
+        self.assertEqual(len(entry.takes), 1)
+        self.assertEqual(entry.takes[0]["file"], "a.wav")
+        self.assertEqual(entry.takes[0]["duration_seconds"], 1.5)
+
+    def test_from_dict_defaults_to_no_takes(self):
+        entry = TimestampEntry.from_dict({"id": 5, "elapsed_seconds": 1})
+        self.assertEqual(entry.takes, [])
+
+
+class SilenceDetectionTests(unittest.TestCase):
+    """Pure mic-level helpers behind the meter and silence auto-stop."""
+
+    def test_rms_int16_silence_is_zero(self):
+        self.assertEqual(rms_int16(b"\x00\x00" * 64), 0.0)
+
+    def test_rms_int16_empty_and_odd_length_are_safe(self):
+        self.assertEqual(rms_int16(b""), 0.0)
+        # A trailing odd byte cannot form a sample and is ignored.
+        self.assertAlmostEqual(rms_int16(struct.pack("<3h", 500, 500, 500) + b"\x01"), 500.0)
+
+    def test_rms_int16_constant_amplitude(self):
+        chunk = struct.pack("<8h", *([1000] * 8))
+        self.assertAlmostEqual(rms_int16(chunk), 1000.0, delta=0.001)
+
+    def test_rms_int16_sine_matches_expected_rms(self):
+        amplitude = 8000
+        samples = [
+            round(amplitude * math.sin(2 * math.pi * i / 32)) for i in range(32)
+        ]
+        expected = amplitude / math.sqrt(2)
+        self.assertAlmostEqual(rms_int16(struct.pack(f"<{len(samples)}h", *samples)), expected, delta=expected * 0.02)
+
+    def test_normalize_level_maps_and_clamps(self):
+        self.assertEqual(normalize_level(0), 0.0)
+        self.assertAlmostEqual(normalize_level(MIC_LEVEL_CLAMP_RMS / 2), 0.5)
+        self.assertEqual(normalize_level(MIC_LEVEL_CLAMP_RMS * 10), 1.0)
+
+    def _monitor(self, **kwargs):
+        monitor = SilenceMonitor(**{"threshold": 250.0, "timeout": 5.0, **kwargs})
+        monitor.reset(100.0)
+        return monitor
+
+    def test_monitor_triggers_only_after_timeout(self):
+        monitor = self._monitor()
+        self.assertFalse(monitor.should_stop(100.5))
+        self.assertFalse(monitor.should_stop(104.9))
+        self.assertTrue(monitor.should_stop(105.0))
+
+    def test_voice_after_partial_silence_still_disarms_auto_stop(self):
+        """Old clock-reset semantics are replaced: once voice is seen, never fire."""
+        monitor = self._monitor()
+        monitor.update(300.0, now=103.0)
+        self.assertFalse(monitor.should_stop(107.9))
+        self.assertFalse(monitor.should_stop(108.0))
+
+    def test_any_detected_activity_disarms_auto_stop(self):
+        """A take with any input is never auto-discarded, even after long silence."""
+        monitor = self._monitor()
+        monitor.update(300.0, now=101.0)
+        self.assertTrue(monitor.voice_detected)
+        # Far beyond the timeout, continuous silence must not fire.
+        self.assertFalse(monitor.should_stop(120.0))
+
+    def test_late_activity_disarms_auto_stop_after_timeout_would_have_fired(self):
+        monitor = self._monitor()
+        self.assertTrue(monitor.should_stop(105.0))
+        monitor.update(300.0, now=106.0)
+        self.assertFalse(monitor.should_stop(200.0))
+
+    def test_quiet_chunks_do_not_extend_the_clock(self):
+        monitor = self._monitor()
+        monitor.update(10.0, now=103.0)
+        self.assertFalse(monitor.voice_detected)
+        self.assertTrue(monitor.should_stop(105.0))
+
+    def test_reset_clears_voice_detection(self):
+        monitor = self._monitor()
+        monitor.update(300.0, now=101.0)
+        self.assertTrue(monitor.voice_detected)
+        monitor.reset(110.0)
+        self.assertFalse(monitor.voice_detected)
+        self.assertTrue(monitor.should_stop(115.0))
+
+    def test_min_elapsed_blocks_instant_stop(self):
+        monitor = self._monitor(timeout=0.5, min_elapsed=1.0)
+        self.assertFalse(monitor.should_stop(100.6))
+        self.assertTrue(monitor.should_stop(101.0))
+
+    def test_discard_without_active_recording_raises(self):
+        recorder = AudioRecorder()
+        with self.assertRaises(AudioError):
+            recorder.discard()
 
 
 if __name__ == "__main__":

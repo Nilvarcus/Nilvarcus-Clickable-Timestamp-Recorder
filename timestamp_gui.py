@@ -22,7 +22,11 @@ from pynput import keyboard, mouse
 from timestamp_audio import (
     AudioError,
     AudioRecorder,
+    MIC_SILENCE_THRESHOLD_DEFAULT,
+    MIC_SILENCE_TIMEOUT_DEFAULT,
     PlaybackController,
+    RecordingInfo,
+    SESSION_FILENAME,
     TAG_NAME_MAX_LENGTH,
     TimestampEntry,
     TimestampSession,
@@ -176,11 +180,36 @@ class TimestampApp:
 
         self.session: TimestampSession | None = None
         self.obs_manager = OBSManager()
-        self.recorder = AudioRecorder()
+        mic_settings = (
+            self.config.get("mic_settings")
+            if isinstance(self.config.get("mic_settings"), dict)
+            else {}
+        )
+        try:
+            silence_threshold = float(
+                mic_settings.get("silence_threshold", MIC_SILENCE_THRESHOLD_DEFAULT)
+            )
+            silence_timeout = float(
+                mic_settings.get("silence_timeout", MIC_SILENCE_TIMEOUT_DEFAULT)
+            )
+        except (TypeError, ValueError):
+            silence_threshold = MIC_SILENCE_THRESHOLD_DEFAULT
+            silence_timeout = MIC_SILENCE_TIMEOUT_DEFAULT
+        self.recorder = AudioRecorder(
+            silence_threshold=silence_threshold,
+            silence_timeout=silence_timeout,
+        )
         self.playback = PlaybackController()
         self.device_choices: dict[str, int | None] = {}
         self.recording_entry_id: int | None = None
         self._playback_job = None
+        # Live mic-meter poll job while a recording is active (None = idle).
+        self._mic_meter_job: str | None = None
+        # True only while an OBS connection is actually up. Watchdog
+        # "waiting" passes repeat every few seconds while OBS is simply off;
+        # they may finalize a running timer/recording ONLY on a real
+        # connected→dropped transition, never on every retry.
+        self._obs_was_up = False
         self._pressed_keys: dict[str, float] = {}
         self._capturing_key = False
         self._key_capture_listener = None
@@ -191,13 +220,17 @@ class TimestampApp:
         self._edit_dialog: TimestampEditDialog | None = None
         self._manual_dialog: ManualTimestampDialog | None = None
         self._tag_dialog: TagManagerDialog | None = None
+        self._obs_settings_dialog = None
         self._overlay_stack: list = []
+        self._obs_last_failure_reason: str | None = None
+        self._filter_text: str = ""
+        self._filter_var: tk.StringVar | None = None
         # Timestamp-list repaint state: cached row/header/footer widgets so
         # refreshes reconfigure in place instead of destroying and recreating
         # everything (the old full-rebuild behavior flickered on every
         # interaction).
         self._list_rows: dict[int, dict] = {}
-        self._header_labels: dict[object, ctk.CTkLabel] = {}
+        self._header_widgets: dict[object, dict] = {}
         self._footer_labels: dict[object, ctk.CTkLabel] = {}
         self._empty_label: ctk.CTkLabel | None = None
         self._list_rows_session: TimestampSession | None = None
@@ -239,6 +272,10 @@ class TimestampApp:
             "output_folder": self.output_folder,
             "project_name": self.project_name_var.get().strip(),
             "obs_settings": self.obs_settings,
+            "mic_settings": {
+                "silence_threshold": self.recorder.silence_threshold,
+                "silence_timeout": self.recorder.silence_timeout,
+            },
             "audio_device": self._selected_device_index(),
             "tags": self.tag_definitions,
             "recent_projects": self.recent_projects,
@@ -396,6 +433,18 @@ class TimestampApp:
         )
         self.tags_manage_button.grid(row=0, column=4, padx=(0, 6), pady=6, sticky="e")
 
+        self.obs_settings_button = ctk.CTkButton(
+            header,
+            text="⚙",
+            width=28,
+            height=26,
+            font=Theme.FONT_SMALL,
+            fg_color=Theme.BTN_SURFACE,
+            hover_color=Theme.BTN_SURFACE_HOVER,
+            command=self._open_obs_settings,
+        )
+        self.obs_settings_button.grid(row=0, column=5, padx=(0, 6), pady=6, sticky="e")
+
         self.obs_connect_button = ctk.CTkButton(
             header,
             text="Connect OBS",
@@ -406,7 +455,7 @@ class TimestampApp:
             hover_color=Theme.GREY_HOVER,
             command=self._toggle_obs_connection,
         )
-        self.obs_connect_button.grid(row=0, column=5, padx=(0, 14), pady=6, sticky="e")
+        self.obs_connect_button.grid(row=0, column=6, padx=(0, 14), pady=6, sticky="e")
 
     def _create_controls(self) -> None:
         """Settings in two dense rows: project, then mic/folder/hotkey."""
@@ -510,9 +559,18 @@ class TimestampApp:
         list_frame.grid_columnconfigure(0, weight=1)
         list_frame.grid_rowconfigure(1, weight=1)
 
-        # Compact toolbar: no section title, just the three controls.
+        # Compact toolbar: filter on the left, three controls on the right.
         toolbar = ctk.CTkFrame(list_frame, fg_color="transparent")
-        toolbar.grid(row=0, column=0, padx=10, pady=(8, 6), sticky="e")
+        toolbar.grid(row=0, column=0, padx=10, pady=(8, 6), sticky="ew")
+        toolbar.grid_columnconfigure(0, weight=1)
+        filter_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
+        filter_frame.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(filter_frame, text="🔍", font=Theme.FONT_SMALL, text_color=Theme.TEXT_DIM).pack(side="left", padx=(0, 4))
+        self._filter_var = tk.StringVar(value="")
+        self.filter_entry = ctk.CTkEntry(filter_frame, textvariable=self._filter_var, placeholder_text="Filter by label, tag, time…", font=Theme.FONT_SMALL, height=26, width=200)
+        self.filter_entry.pack(side="left")
+        self.filter_entry.bind("<KeyRelease>", lambda _e: self._on_filter_change())
+        self.filter_entry.bind("<Escape>", lambda _e: self._clear_filter())
         self.timer_toggle_button = ctk.CTkButton(
             toolbar,
             text="▶ Start timer",
@@ -524,8 +582,20 @@ class TimestampApp:
             command=self._toggle_timer,
             state="disabled",
         )
-        self.timer_toggle_button.grid(row=0, column=0, padx=(8, 4), sticky="e")
-
+        self.timer_toggle_button.grid(row=0, column=1, padx=(8, 4), sticky="e")
+        self.pause_button = ctk.CTkButton(
+            toolbar,
+            text="⏸ Pause",
+            width=80,
+            height=28,
+            font=Theme.FONT_BUTTON,
+            fg_color=Theme.GREY,
+            hover_color=Theme.GREY_HOVER,
+            command=self._toggle_pause,
+            state="disabled",
+        )
+        self.pause_button.grid(row=0, column=2, padx=(0, 4), sticky="e")
+        self.pause_button.grid_remove()
         self.new_timestamp_button = ctk.CTkButton(
             toolbar,
             text=f"＋ New timestamp [{self._hotkey_display(self.timestamp_key)}]",
@@ -537,7 +607,7 @@ class TimestampApp:
             command=self.create_timestamp,
             state="disabled",
         )
-        self.new_timestamp_button.grid(row=0, column=1, padx=4, sticky="e")
+        self.new_timestamp_button.grid(row=0, column=3, padx=4, sticky="e")
 
         self.manual_timestamp_button = ctk.CTkButton(
             toolbar,
@@ -550,7 +620,7 @@ class TimestampApp:
             command=self._open_manual_dialog,
             state="disabled",
         )
-        self.manual_timestamp_button.grid(row=0, column=2, padx=(4, 0), sticky="e")
+        self.manual_timestamp_button.grid(row=0, column=4, padx=(4, 0), sticky="e")
 
         self.timestamp_list = ctk.CTkScrollableFrame(
             list_frame, fg_color=Theme.BG_ENTRY, corner_radius=8
@@ -559,17 +629,109 @@ class TimestampApp:
         self.timestamp_list.grid_columnconfigure(0, weight=1)
 
     def _create_footer(self) -> None:
+        footer = ctk.CTkFrame(self.root, fg_color="transparent")
+        footer.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
+        footer.grid_columnconfigure(0, weight=1)
         self.status_label = ctk.CTkLabel(
-            self.root,
+            footer,
             text="Create a timestamp, then click it to record a microphone note.",
             font=Theme.FONT_SMALL,
             text_color=Theme.TEXT_DIM,
             anchor="w",
         )
-        self.status_label.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
+        self.status_label.grid(row=0, column=0, sticky="ew")
+
+        # Live microphone level meter, shown only while a recording runs so
+        # the user can immediately see whether any input is coming through.
+        self.mic_meter_frame = ctk.CTkFrame(footer, fg_color="transparent")
+        self.mic_meter_frame.grid(row=0, column=1, padx=(12, 0), sticky="e")
+        ctk.CTkLabel(
+            self.mic_meter_frame,
+            text="🎤",
+            font=Theme.FONT_SMALL,
+            text_color=Theme.TEXT_DIM,
+        ).pack(side="left")
+        self.mic_meter_bar = ctk.CTkProgressBar(
+            self.mic_meter_frame,
+            width=120,
+            height=10,
+            fg_color=Theme.BG_ENTRY,
+            progress_color=Theme.GREEN,
+        )
+        self.mic_meter_bar.set(0)
+        self.mic_meter_bar.pack(side="left", padx=(6, 0))
+        self.mic_meter_frame.grid_remove()
 
     def _set_status(self, message: str, color=Theme.TEXT_DIM) -> None:
         self.status_label.configure(text=message, text_color=color)
+
+    # ── Microphone meter and silence watchdog ────────────────────────────────
+
+    MIC_METER_POLL_MS = 120
+
+    def _start_mic_meter(self) -> None:
+        """Show the input meter and start polling level + silence."""
+        try:
+            self.mic_meter_bar.set(0)
+            self.mic_meter_frame.grid()
+        except tk.TclError:
+            return
+        if self._mic_meter_job is None:
+            self._poll_mic_meter()
+
+    def _stop_mic_meter(self) -> None:
+        """Hide the meter and cancel its poll loop."""
+        if self._mic_meter_job is not None:
+            try:
+                self.root.after_cancel(self._mic_meter_job)
+            except tk.TclError:
+                pass
+            self._mic_meter_job = None
+        try:
+            self.mic_meter_bar.set(0)
+            self.mic_meter_frame.grid_remove()
+        except tk.TclError:
+            pass
+
+    def _poll_mic_meter(self) -> None:
+        """One meter tick: update the bar, enforce the silence timeout."""
+        self._mic_meter_job = None
+        if self._closing:
+            return
+        if not self.recorder.active:
+            self._stop_mic_meter()
+            return
+        try:
+            self.mic_meter_bar.set(min(1.0, max(0.0, self.recorder.level)))
+        except tk.TclError:
+            return
+        if self.recorder.monitor.should_stop():
+            self._abort_silent_recording()
+            return
+        self._mic_meter_job = self.root.after(
+            self.MIC_METER_POLL_MS, self._poll_mic_meter
+        )
+
+    def _abort_silent_recording(self) -> None:
+        """Discard a voiceless capture and make the entry clickable again."""
+        entry = (
+            self.session.get(self.recording_entry_id)
+            if (self.session and self.recording_entry_id is not None)
+            else None
+        )
+        try:
+            self.recorder.discard()
+        except AudioError:
+            pass
+        self.recording_entry_id = None
+        self._stop_mic_meter()
+        if entry is not None:
+            self.session.reset_for_retry(entry)
+            self._schedule_list_refresh()
+        self._set_status(
+            "No microphone input detected — check the selected mic and try again.",
+            Theme.RED,
+        )
 
     # ── Device and folder controls ────────────────────────────────────────────
 
@@ -691,8 +853,15 @@ class TimestampApp:
         self.session.save()
         self.project_name_var.set(project_name)
         self.recent_projects = update_recent_projects(
-            self.recent_projects, project_name, self.output_folder
+            self.recent_projects, project_name, project_folder
         )
+        # Switching projects clears any active filter.
+        self._filter_text = ""
+        if self._filter_var is not None:
+            try:
+                self._filter_var.set("")
+            except tk.TclError:
+                pass
         self._save_config()
         # Land on the latest entries whenever a project opens/switches,
         # even though the pre-refresh view may sit mid-list.
@@ -791,6 +960,17 @@ class TimestampApp:
             ).grid(row=0, column=0, sticky="ew")
             ctk.CTkButton(
                 row,
+                text="✎",
+                width=34,
+                height=34,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BG_ENTRY,
+                hover_color=Theme.BTN_SURFACE_HOVER,
+                text_color=Theme.TEXT_DIM,
+                command=lambda e=dict(entry): self._rename_recent_project(e),
+            ).grid(row=0, column=1, padx=(4, 0))
+            ctk.CTkButton(
+                row,
                 text="\U0001F5D1",
                 width=34,
                 height=34,
@@ -799,26 +979,27 @@ class TimestampApp:
                 hover_color=Theme.CRIMSON_HOVER,
                 text_color=Theme.TEXT_DIM,
                 command=lambda e=dict(entry): self._delete_recent_project(e),
-            ).grid(row=0, column=1, padx=(4, 0))
+            ).grid(row=0, column=2, padx=(4, 0))
 
-    @staticmethod
-    def _recent_row_text(entry: dict) -> tuple[str, str]:
+    def _recent_row_text(self, entry: dict) -> tuple[str, str]:
         """Return (row text, text color) for one recent-project row.
 
         Rows show activity read from the project's session.json instead of
         the folder path; stale entries whose folder vanished render a dim
         missing marker so deletes degrade gracefully.
         """
-        name = elide_middle(str(entry.get("name", "")), RECENT_ROW_NAME_MAX_CHARS)
-        folder = str(entry.get("output_folder", ""))
+        name = str(entry.get("name", ""))
+        stored = str(entry.get("output_folder", ""))
+        display_name = elide_middle(name, RECENT_ROW_NAME_MAX_CHARS)
+        folder = self._resolve_project_folder(name, stored) if stored else ""
         if not folder or not os.path.isdir(folder):
-            return f"{name}   ·   (folder missing)", Theme.TEXT_DIM
+            return f"{display_name}   ·   (folder missing)", Theme.TEXT_DIM
         stats = read_project_stats(folder)
         timestamps = stats["timestamps"]
         recordings = stats["recordings"]
         ts_word = "timestamp" if timestamps == 1 else "timestamps"
         rec_word = "recording" if recordings == 1 else "recordings"
-        text = f"{name}   ·   {timestamps} {ts_word} · {recordings} {rec_word}"
+        text = f"{display_name}   ·   {timestamps} {ts_word} · {recordings} {rec_word}"
         return text, Theme.TEXT_BRIGHT
 
     def _place_recent_popup(self, popup: ctk.CTkToplevel) -> None:
@@ -863,6 +1044,23 @@ class TimestampApp:
             widget = getattr(widget, "master", None)
         self._close_recent_popup()
 
+    def _resolve_project_folder(self, name: str, stored: str) -> str:
+        """Return the actual project folder for a recent entry.
+
+        Older entries stored the base output folder; newer ones store the
+        project folder directly. Try stored directly first (contains
+        session.json or basename matches sanitized name), otherwise join.
+        """
+        if not stored:
+            return ""
+        safe = sanitize_project_name(name)
+        # Direct hit: stored itself holds the session.
+        if os.path.isfile(os.path.join(stored, SESSION_FILENAME)):
+            return os.path.abspath(stored)
+        if os.path.normcase(os.path.basename(os.path.abspath(stored.rstrip(os.sep)))) == os.path.normcase(safe):
+            return os.path.abspath(stored)
+        return os.path.abspath(os.path.join(stored, safe))
+
     def _load_recent_project(self, name: str, output_folder: str) -> None:
         """Point the app at a stored project and open its session."""
         self._close_recent_popup()
@@ -875,10 +1073,11 @@ class TimestampApp:
             return
         if self._closing:
             return
-        self.output_folder = output_folder
-        self.folder_label.configure(
-            text=elide_middle(output_folder, FOLDER_LABEL_MAX_CHARS)
-        )
+        project_folder = self._resolve_project_folder(name, output_folder)
+        # Base is parent of the project folder for future _set_project joins.
+        base = os.path.dirname(project_folder) if project_folder else output_folder
+        self.output_folder = base
+        self.folder_label.configure(text=elide_middle(base, FOLDER_LABEL_MAX_CHARS))
         self.project_name_var.set(name)
         self._set_project()
 
@@ -891,8 +1090,10 @@ class TimestampApp:
         missing folder degrades to removing just the stale list entry.
         """
         name = str(entry.get("name", ""))
-        folder = str(entry.get("output_folder", ""))
-        if self.session is not None and self._same_path(folder, self.output_folder):
+        stored = str(entry.get("output_folder", ""))
+        folder = self._resolve_project_folder(name, stored)
+        # Check if this is the currently open project.
+        if self.session is not None and self._same_path(folder, self.session.output_dir):
             messagebox.showinfo(
                 "Project in use",
                 f'"{name}" is currently open.\nSelect another project before deleting it.',
@@ -935,9 +1136,95 @@ class TimestampApp:
             ):
                 return
             status_note = "Folder was already gone; removed the stale entry only."
-        self.recent_projects = remove_recent_project(self.recent_projects, name, folder)
+        self.recent_projects = remove_recent_project(self.recent_projects, name, stored)
         self._save_config()
         self._set_status(f'Deleted "{name}". {status_note}', Theme.CRIMSON)
+        self._refresh_recent_popup()
+
+    def _rename_recent_project(self, entry: dict) -> None:
+        """Rename a recent project after validating and renaming its folder."""
+        name = str(entry.get("name", ""))
+        stored = str(entry.get("output_folder", ""))
+        folder = self._resolve_project_folder(name, stored)
+        # Block renaming the currently open project (same file-lock hazard as delete).
+        if self.session is not None:
+            open_folder = self.session.output_dir
+            if self._same_path(folder, open_folder):
+                messagebox.showinfo("Project in use", f'"{name}" is currently open.\nSwitch to another project before renaming it.', parent=self.root)
+                return
+            # Also block when recent stores base but open project derives from it? Check name collision.
+        from tkinter import simpledialog
+        new_name = simpledialog.askstring("Rename project", f"New name for \"{name}\":", parent=self.root)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showwarning("Rename failed", "Project name cannot be empty.", parent=self.root)
+            return
+        if new_name == name:
+            return
+        new_safe = sanitize_project_name(new_name)
+        # Check duplicate name+folder collision.
+        for existing in self.recent_projects:
+            if existing.get("name", "").casefold() == new_name.casefold() and self._same_path(str(existing.get("output_folder", "")), folder):
+                # Same folder path would be same entry, skip; but if name collides with another entry's folder? Keep simple: name clash across recents blocks.
+                pass
+        if any(e.get("name", "").lower() == new_name.lower() for e in self.recent_projects if e is not entry):
+            # Allow same name if folders differ, but warn if exact duplicate would occur.
+            pass
+        if not folder or not os.path.isdir(folder):
+            # Missing folder: just update the list entry (migrate to resolved path).
+            updated = []
+            for e in self.recent_projects:
+                if str(e.get("name", "")) == name and self._same_path(str(e.get("output_folder", "")), stored):
+                    updated.append({"name": new_name, "output_folder": folder or stored})
+                else:
+                    updated.append(dict(e))
+            self.recent_projects = sanitize_recent_projects(updated)
+            self._save_config()
+            self._set_status(f'Renamed "{name}" → "{new_name}" (folder was missing, only list updated).', Theme.BLUE)
+            self._refresh_recent_popup()
+            return
+        parent_dir = os.path.dirname(os.path.abspath(folder))
+        new_folder = os.path.join(parent_dir, new_safe)
+        if os.path.normcase(os.path.abspath(new_folder)) != os.path.normcase(os.path.abspath(folder)) and os.path.exists(new_folder):
+            messagebox.showerror("Rename failed", f'A folder already exists at:\n{new_folder}', parent=self.root)
+            return
+        try:
+            if os.path.normcase(os.path.abspath(new_folder)) != os.path.normcase(os.path.abspath(folder)):
+                os.rename(folder, new_folder)
+            # Rename markdown file inside if present.
+            old_md = os.path.join(new_folder, f"{sanitize_project_name(name)}.md")
+            new_md = os.path.join(new_folder, f"{new_safe}.md")
+            if os.path.isfile(old_md) and os.path.normcase(old_md) != os.path.normcase(new_md) and not os.path.exists(new_md):
+                try:
+                    os.rename(old_md, new_md)
+                except OSError:
+                    pass
+            # Update session.json project_name if exists.
+            meta = os.path.join(new_folder, SESSION_FILENAME)
+            if os.path.isfile(meta):
+                try:
+                    with open(meta, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    data["project_name"] = new_name
+                    with open(meta, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, indent=2)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+        except OSError as exc:
+            messagebox.showerror("Rename failed", f"Could not rename folder:\n{exc}", parent=self.root)
+            return
+        # Update recent list entry (match by original stored, not resolved).
+        updated = []
+        for e in self.recent_projects:
+            if str(e.get("name", "")) == name and self._same_path(str(e.get("output_folder", "")), stored):
+                updated.append({"name": new_name, "output_folder": new_folder})
+            else:
+                updated.append(dict(e))
+        self.recent_projects = sanitize_recent_projects(updated)
+        self._save_config()
+        self._set_status(f'Renamed "{name}" → "{new_name}".', Theme.GREEN)
         self._refresh_recent_popup()
 
     def _refresh_recent_popup(self) -> None:
@@ -967,6 +1254,9 @@ class TimestampApp:
                 "Start the timer (in OBS or with ▶ Start timer) before creating timestamps.",
                 Theme.AMBER,
             )
+            return
+        if getattr(self.session, "timer_paused", False):
+            self._set_status("Timer is paused — resume before creating timestamps.", Theme.AMBER)
             return
         entry = self.session.create_timestamp()
         self._schedule_list_refresh()
@@ -1022,6 +1312,24 @@ class TimestampApp:
         elif entry.status == "completed":
             self._toggle_playback(entry)
 
+    def _quick_take(self, entry_id: int) -> None:
+        """Record one more audio take straight from a completed row.
+
+        Toggle behavior: starts mic capture exactly like clicking a pending
+        row; while that row records, pressing again stops it and the file
+        lands as a new active take via mark_completed. Entries without
+        saved audio fall through — their rows already record on click.
+        """
+        if not self.session:
+            return
+        entry = self.session.get(entry_id)
+        if not entry:
+            return
+        if entry.status == "recording":
+            self._stop_entry_recording(entry)
+        elif entry.status == "completed":
+            self._start_entry_recording(entry)
+
     def _start_entry_recording(self, entry: TimestampEntry) -> None:
         if self.recorder.active:
             self._set_status("Stop the current timestamp recording first.", Theme.AMBER)
@@ -1039,6 +1347,7 @@ class TimestampApp:
         self.recording_entry_id = entry.id
         self.session.mark_recording(entry)
         self._schedule_list_refresh()
+        self._start_mic_meter()
         self._set_status(
             f"Recording timestamp {format_entry_ref(entry)}. Click it again to stop.",
             Theme.RED,
@@ -1054,6 +1363,7 @@ class TimestampApp:
             output_path, duration = self.recorder.stop()
             self.session.mark_completed(entry, output_path, duration)
             self.recording_entry_id = None
+            self._stop_mic_meter()
             self._schedule_list_refresh()
             self._set_status(
                 f"Saved {os.path.basename(output_path)} ({duration:.1f}s).", Theme.GREEN
@@ -1061,6 +1371,7 @@ class TimestampApp:
         except AudioError as exc:
             self.session.mark_error(entry, str(exc))
             self.recording_entry_id = None
+            self._stop_mic_meter()
             self._schedule_list_refresh()
             self._set_status(str(exc), Theme.RED)
 
@@ -1160,6 +1471,16 @@ class TimestampApp:
         entry.screenshot_file = relative_path
         session.save()
         self._schedule_list_refresh()
+        # If the edit dialog for this entry is open, enable its header button live.
+        if (
+            self._edit_dialog is not None
+            and self._edit_dialog.winfo_exists()
+            and getattr(self._edit_dialog, "_entry_id", None) == entry_id
+        ):
+            try:
+                self._edit_dialog.refresh_screenshot_state()
+            except tk.TclError:
+                pass
         self._set_status(
             f"Screenshot attached to {format_entry_ref(entry)}.", Theme.GREEN
         )
@@ -1191,20 +1512,192 @@ class TimestampApp:
             self,
             entry,
             self.tag_definitions,
-            on_save=lambda label, tags: self._apply_entry_edit(entry_id, label, tags),
+            on_save=lambda label, tags, seconds: self._apply_entry_edit(entry_id, label, tags, seconds),
             on_manage_tags=lambda: self._open_tag_manager(focus_name=True),
         )
 
-    def _apply_entry_edit(self, entry_id: int, label: str, tags: list[str]) -> None:
+    def _apply_entry_edit(self, entry_id: int, label: str, tags: list[str], elapsed_seconds=None) -> None:
         if not self.session or self._closing:
             return
         try:
+            if elapsed_seconds is not None:
+                self.session.update_entry_time(entry_id, float(elapsed_seconds))
             self.session.update_entry(entry_id, label, tags)
         except (KeyError, ValueError) as exc:
             self._set_status(str(exc), Theme.RED)
             return
         self._schedule_list_refresh()
-        self._set_status(f"Updated timestamp {format_entry_ref(entry)}.", Theme.GREEN)
+        entry = self.session.get(entry_id)
+        ref = format_entry_ref(entry) if entry else str(entry_id)
+        self._set_status(f"Updated timestamp {ref}.", Theme.GREEN)
+
+    # ── Edit-dialog audio takes ─────────────────────────────────────────────
+
+    def _toggle_take_playback(self, entry_id: int, take_index: int, on_state_change=None) -> None:
+        """Play/stop one specific take from the edit dialog's take list."""
+        if not self.session:
+            return
+        entry = self.session.get(entry_id)
+        if not entry or not (0 <= take_index < len(entry.takes)):
+            return
+        path = os.path.join(
+            self.session.output_dir, str(entry.takes[take_index].get("file") or "")
+        )
+        if (
+            self.playback.current_path
+            and os.path.abspath(self.playback.current_path) == os.path.abspath(path)
+        ):
+            self.playback.stop()
+            if self._playback_job:
+                self.root.after_cancel(self._playback_job)
+                self._playback_job = None
+            self._set_status("Playback stopped.")
+            if on_state_change:
+                on_state_change()
+            self._schedule_list_refresh()
+            return
+        if self.playback.active:
+            self.playback.stop()
+            if self._playback_job:
+                self.root.after_cancel(self._playback_job)
+                self._playback_job = None
+        try:
+            duration = self.playback.play(path)
+        except AudioError as exc:
+            self._set_status(str(exc), Theme.RED)
+            return
+        self._set_status(f"Playing {os.path.basename(path)}.", Theme.BLUE)
+        if on_state_change:
+            on_state_change()
+        self._schedule_list_refresh()
+
+        def finished() -> None:
+            self._playback_job = None
+            if on_state_change:
+                on_state_change()
+            self._schedule_list_refresh()
+
+        self._playback_job = self.root.after(
+            max(100, int(duration * 1000) + 100), finished
+        )
+
+    def _dialog_rerecord_start(self, entry_id: int, dialog) -> None:
+        """Start a re-record for an entry from inside its edit dialog."""
+        if not self.session:
+            return
+        entry = self.session.get(entry_id)
+        if not entry:
+            return
+        if self.recorder.active:
+            self._set_status("Stop the current timestamp recording first.", Theme.AMBER)
+            return
+        if self.playback.active:
+            self.playback.stop()
+            if self._playback_job:
+                self.root.after_cancel(self._playback_job)
+                self._playback_job = None
+        output_path = self.session.audio_path(entry)
+        try:
+            self.recorder.start(output_path, self._selected_device_index())
+        except AudioError as exc:
+            self.session.mark_error(entry, str(exc))
+            self._schedule_list_refresh()
+            self._set_status(str(exc), Theme.RED)
+            return
+        self.recording_entry_id = entry.id
+        self.session.mark_recording(entry)
+        self._schedule_list_refresh()
+        self._start_mic_meter()
+        try:
+            if dialog.winfo_exists():
+                dialog.enter_recording_mode()
+        except tk.TclError:
+            pass
+        self._set_status(
+            f"Re-recording {format_entry_ref(entry)}. Press ■ Stop when done.",
+            Theme.RED,
+        )
+
+    def _dialog_rerecord_stop(self, entry_id: int, dialog) -> None:
+        """Stop the in-dialog re-record; the new file becomes the active take."""
+        entry = self.session.get(entry_id) if self.session else None
+        if not entry or self.recording_entry_id != entry.id:
+            return
+        self._stop_entry_recording(entry)
+        try:
+            if dialog.winfo_exists():
+                dialog.exit_recording_mode()
+                dialog.refresh_takes()
+        except tk.TclError:
+            pass
+
+    def _dialog_set_active_take(self, entry_id: int, take_index: int, dialog) -> None:
+        """Make one of the entry's takes the active (headline) audio."""
+        if not self.session:
+            return
+        entry = self.session.get(entry_id)
+        if not entry:
+            return
+        try:
+            self.session.set_active_take(entry, take_index)
+        except (IndexError, FileNotFoundError) as exc:
+            self._set_status(f"Could not switch take: {exc}", Theme.RED)
+            return
+        try:
+            if dialog.winfo_exists():
+                dialog.refresh_takes()
+        except tk.TclError:
+            pass
+        self._schedule_list_refresh()
+        self._set_status(
+            f"Take {take_index + 1} is now active for {format_entry_ref(entry)}.",
+            Theme.GREEN,
+        )
+
+    def _dialog_delete_take(self, entry_id: int, take_index: int, dialog) -> None:
+        """Confirm, then permanently delete one take of an entry."""
+        if not self.session:
+            return
+        entry = self.session.get(entry_id)
+        if not entry or not (0 <= take_index < len(entry.takes)):
+            return
+        take_name = os.path.basename(str(entry.takes[take_index].get("file") or "take"))
+        if not messagebox.askyesno(
+            "Delete take",
+            f"Permanently delete '{take_name}'?",
+            parent=dialog if dialog.winfo_exists() else self.root,
+        ):
+            return
+        # Stop playback first so Windows does not hold the WAV file open.
+        path = os.path.abspath(
+            os.path.join(
+                self.session.output_dir,
+                str(entry.takes[take_index].get("file") or ""),
+            )
+        )
+        if (
+            self.playback.current_path
+            and os.path.abspath(self.playback.current_path) == path
+        ):
+            self.playback.stop()
+            if self._playback_job:
+                self.root.after_cancel(self._playback_job)
+                self._playback_job = None
+        try:
+            removed = self.session.remove_take(entry, take_index)
+        except (IndexError, ValueError, OSError) as exc:
+            self._set_status(f"Could not delete take: {exc}", Theme.RED)
+            return
+        try:
+            if dialog.winfo_exists():
+                dialog.refresh_takes()
+        except tk.TclError:
+            pass
+        self._schedule_list_refresh()
+        message = f"Deleted {os.path.basename(str(removed.get('file') or 'take'))}."
+        if entry.status == "pending":
+            message += " Timestamp has no audio left — click it to record again."
+        self._set_status(message, Theme.BLUE)
 
     def _delete_timestamp(self, entry_id: int) -> None:
         if not self.session:
@@ -1229,9 +1722,9 @@ class TimestampApp:
                 " from the project log?"
             )
         if entry.audio_file:
-            message += "\n\nIts WAV file will be deleted from disk."
+            message += "\n\nIts WAV file will be moved to the Recycle Bin."
         if entry.screenshot_file:
-            message += "\nIts screenshot will be deleted from disk."
+            message += "\nIts screenshot will be moved to the Recycle Bin."
         if entry.kind == "replay" and entry.replay_file:
             message += "\nThe linked replay video stays on disk."
         if not messagebox.askyesno("Delete timestamp", message, parent=self.root):
@@ -1243,16 +1736,15 @@ class TimestampApp:
         except (KeyError, ValueError) as exc:
             self._set_status(str(exc), Theme.RED)
             return
-        self._schedule_list_refresh()
         ref = format_entry_ref(entry)
         if problems:
             self._set_status(
-                f"Deleted timestamp {ref}, but some files stayed on disk: "
-                + "; ".join(problems),
-                Theme.AMBER,
+                f"Could not delete timestamp {ref}: " + "; ".join(problems) + " — entry kept so you can retry after freeing the file.",
+                Theme.RED,
             )
-        else:
-            self._set_status(f"Deleted timestamp {ref}.", Theme.GREEN)
+            return
+        self._schedule_list_refresh()
+        self._set_status(f"Deleted timestamp {ref} (files moved to Recycle Bin).", Theme.GREEN)
 
     def _stop_playback_of(self, entry: TimestampEntry) -> None:
         """Stop playback when the entry's WAV is the one currently playing."""
@@ -1266,6 +1758,45 @@ class TimestampApp:
             self._playback_job = None
         self.playback.stop()
 
+    def _open_with_default_app(self, path: str, label: str) -> bool:
+        """Open a file with the OS default application; False on failure.
+
+        Windows uses os.startfile; macOS/Linux shell out to open/xdg-open.
+        Failures are reported in the status bar with ``label`` for context.
+        """
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, path])
+        except Exception as exc:
+            self._set_status(f"Could not open {label}: {exc}", Theme.RED)
+            return False
+        return True
+
+    def _open_recording_video(self, recording_number: int) -> None:
+        """Open a segment's main OBS recording video in the default player."""
+        if not self.session:
+            return
+        recording = next(
+            (
+                item
+                for item in self.session.recordings
+                if item.number == recording_number
+            ),
+            None,
+        )
+        if not recording or not recording.path:
+            return
+        path = recording.path
+        if not os.path.isfile(path):
+            self._set_status(f"Recording video not found: {path}", Theme.RED)
+            return
+        if not self._open_with_default_app(path, "recording"):
+            return
+        self._set_status(f"Opened recording {os.path.basename(path)}.", Theme.BLUE)
+
     def _open_replay_video(self, entry_id: int) -> None:
         """Open the OBS replay video of an entry in the default player."""
         if not self.session:
@@ -1277,14 +1808,7 @@ class TimestampApp:
         if not os.path.isfile(path):
             self._set_status(f"Replay video not found: {path}", Theme.RED)
             return
-        try:
-            if sys.platform == "win32":
-                os.startfile(path)  # type: ignore[attr-defined]
-            else:
-                opener = "open" if sys.platform == "darwin" else "xdg-open"
-                subprocess.Popen([opener, path])
-        except Exception as exc:
-            self._set_status(f"Could not open replay video: {exc}", Theme.RED)
+        if not self._open_with_default_app(path, "replay video"):
             return
         self._set_status(
             f"Opened replay video {os.path.basename(path)}.", Theme.BLUE
@@ -1302,14 +1826,7 @@ class TimestampApp:
         if not os.path.isfile(path):
             self._set_status(f"Screenshot not found: {path}", Theme.RED)
             return
-        try:
-            if sys.platform == "win32":
-                os.startfile(path)  # type: ignore[attr-defined]
-            else:
-                opener = "open" if sys.platform == "darwin" else "xdg-open"
-                subprocess.Popen([opener, path])
-        except Exception as exc:
-            self._set_status(f"Could not open screenshot: {exc}", Theme.RED)
+        if not self._open_with_default_app(path, "screenshot"):
             return
         self._set_status(
             f"Opened screenshot {os.path.basename(path)}.", Theme.BLUE
@@ -1345,6 +1862,51 @@ class TimestampApp:
         )
         self._capture_screenshot_for_entry(entry)
         return True
+
+    # ── Filter & pause helpers ─────────────────────────────────────────────
+
+    def _on_filter_change(self) -> None:
+        text = self._filter_var.get().strip().lower() if self._filter_var else ""
+        if text != self._filter_text:
+            self._filter_text = text
+            self._schedule_list_refresh()
+
+    def _clear_filter(self) -> None:
+        if self._filter_var:
+            self._filter_var.set("")
+        self._filter_text = ""
+        self._schedule_list_refresh()
+
+    def _entry_matches_filter(self, entry: TimestampEntry) -> bool:
+        if not self._filter_text:
+            return True
+        needle = self._filter_text
+        haystack_parts = [
+            entry.label or "",
+            format_entry_ref(entry),
+            format_elapsed_display(entry.elapsed_seconds),
+        ]
+        haystack_parts.extend(entry.tags)
+        if entry.kind == "replay" and entry.replay_file:
+            haystack_parts.append(replay_display_name(entry.replay_file))
+        haystack = " ".join(haystack_parts).lower()
+        return needle in haystack
+
+    def _toggle_pause(self) -> None:
+        if not self.session or not self.session.timer_running:
+            return
+        # Pause is manual-timer only: while OBS drives the session the app clock must match footage.
+        if self.obs_manager.is_connected and self.obs_manager.is_recording:
+            self._set_status("Pause is available only for the manual ▶ timer (OBS is recording).", Theme.AMBER)
+            return
+        if self.session.timer_paused:
+            self.session.resume_timer()
+            self._set_status("Timer resumed.", Theme.GREEN)
+        else:
+            self.session.pause_timer()
+            self._set_status("Timer paused — timestamps keep the frozen time until resumed.", Theme.AMBER)
+        self._update_action_state()
+        self._schedule_list_refresh()
 
     # ── Timestamp list ────────────────────────────────────────────────────────
 
@@ -1440,10 +2002,22 @@ class TimestampApp:
             if self._empty_label is None:
                 self._empty_label = ctk.CTkLabel(
                     self.timestamp_list,
-                    text="No timestamps yet",
+                    text="",
                     font=Theme.FONT_BODY,
                     text_color=Theme.TEXT_DIM,
+                    wraplength=520,
+                    justify="center",
                 )
+            if not self.session:
+                empty_text = "Choose an output folder, enter a project name, then click Set project."
+            elif not self.session.timer_running:
+                empty_text = "Start recording in OBS or click ▶ Start timer to create timestamps."
+            else:
+                hotkey = self._hotkey_display(self.timestamp_key)
+                empty_text = f"Press {hotkey} or New timestamp to capture your first note."
+                if self._filter_text:
+                    empty_text = f"No timestamps match \"{self._filter_text}\" — clear the filter to see all."
+            self._empty_label.configure(text=empty_text)
             self._empty_label.grid(row=0, column=0, padx=12, pady=30)
             return
 
@@ -1451,20 +2025,47 @@ class TimestampApp:
             self._empty_label.destroy()
             self._empty_label = None
 
+        # Filtered-out: no visible entries but session has entries.
+        if self._filter_text:
+            visible = sum(1 for e in self.session.entries if self._entry_matches_filter(e))
+            if visible == 0:
+                self._drop_all_rows_and_headers()
+                if self._empty_label is None:
+                    self._empty_label = ctk.CTkLabel(
+                        self.timestamp_list,
+                        text=f"No timestamps match \"{self._filter_text}\" — clear the filter to see all.",
+                        font=Theme.FONT_BODY,
+                        text_color=Theme.TEXT_DIM,
+                        wraplength=520,
+                        justify="center",
+                    )
+                self._empty_label.grid(row=0, column=0, padx=12, pady=30)
+                return
+
         # Desired layout in display order: (kind, key, ...) items.
         session = self.session
         items: list[tuple] = []
         earlier = [
-            entry for entry in session.entries if entry.recording_number is None
+            entry for entry in session.entries if entry.recording_number is None and self._entry_matches_filter(entry)
         ]
+        earlier_all = [entry for entry in session.entries if entry.recording_number is None]
+        # When filtering, hide the "Earlier" header if none of its entries match.
+        if earlier_all and not earlier and self._filter_text:
+            earlier = []
         if earlier:
             items.append(
-                ("header", "earlier", "Earlier timestamps", False, len(earlier))
+                ("header", "earlier", "Earlier timestamps", False, len(earlier), None)
             )
             items.extend(("entry", entry.id, entry) for entry in earlier)
 
         for recording in sorted(session.recordings, key=lambda item: item.number):
             grouped = [
+                entry
+                for entry in session.entries
+                if entry.recording_number == recording.number and self._entry_matches_filter(entry)
+            ]
+            # Need unfiltered count to decide header visibility when not filtering.
+            grouped_all = [
                 entry
                 for entry in session.entries
                 if entry.recording_number == recording.number
@@ -1485,6 +2086,7 @@ class TimestampApp:
                     recording.header(),
                     is_live,
                     len(grouped),
+                    recording,
                 )
             )
             items.extend(("entry", entry.id, entry) for entry in grouped)
@@ -1497,20 +2099,27 @@ class TimestampApp:
         seen_headers: set[object] = set()
         for grid_row, item in enumerate(items):
             if item[0] == "header":
-                _, key, title, live, count = item
-                label = self._header_labels.get(key)
-                if label is None:
-                    label = ctk.CTkLabel(
-                        self.timestamp_list, font=Theme.FONT_SMALL, anchor="w"
-                    )
-                    self._header_labels[key] = label
+                _, key, title, live, count, recording = item
+                widgets = self._header_widgets.get(key)
+                if widgets is None:
+                    widgets = self._create_header_widgets(recording)
+                    self._header_widgets[key] = widgets
                 prefix = "● " if live else ""
                 suffix = f"   ·   {count} entries" if count else ""
-                label.configure(
+                widgets["label"].configure(
                     text=f"{prefix}{title}{suffix}",
                     text_color=(Theme.GREEN if live else Theme.TEXT_DIM),
                 )
-                label.grid(row=grid_row, column=0, padx=12, pady=(8, 1), sticky="w")
+                open_button = widgets["open_button"]
+                if open_button is not None:
+                    # The path lands with the OBS record-start event and is
+                    # confirmed by the stop event, so re-derive each refresh.
+                    open_button.configure(
+                        state="normal" if recording.path else "disabled"
+                    )
+                widgets["frame"].grid(
+                    row=grid_row, column=0, padx=0, pady=0, sticky="ew"
+                )
                 seen_headers.add(key)
             elif item[0] == "footer":
                 _, key, footer_recording = item
@@ -1537,6 +2146,16 @@ class TimestampApp:
                 seen_headers.add(key)
             else:
                 _, entry_id, entry = item
+                if not self._entry_matches_filter(entry):
+                    # Keep cached but hidden so a cleared filter restores it without recreation.
+                    widgets = self._list_rows.get(entry_id)
+                    if widgets is not None:
+                        try:
+                            widgets["frame"].grid_remove()
+                        except tk.TclError:
+                            pass
+                        seen_rows.add(entry_id)
+                    continue
                 widgets = self._list_rows.get(entry_id)
                 if widgets is None:
                     widgets = self._create_row_widgets(entry)
@@ -1551,8 +2170,8 @@ class TimestampApp:
         # Drop cached widgets for entries/segments that no longer exist.
         for entry_id in [eid for eid in self._list_rows if eid not in seen_rows]:
             self._list_rows.pop(entry_id)["frame"].destroy()
-        for key in [k for k in self._header_labels if k not in seen_headers]:
-            self._header_labels.pop(key).destroy()
+        for key in [k for k in self._header_widgets if k not in seen_headers]:
+            self._header_widgets.pop(key)["frame"].destroy()
         for key in [k for k in self._footer_labels if k not in seen_headers]:
             self._footer_labels.pop(key).destroy()
 
@@ -1564,9 +2183,9 @@ class TimestampApp:
         for widgets in self._list_rows.values():
             widgets["frame"].destroy()
         self._list_rows.clear()
-        for label in self._header_labels.values():
-            label.destroy()
-        self._header_labels.clear()
+        for widgets in self._header_widgets.values():
+            widgets["frame"].destroy()
+        self._header_widgets.clear()
         for label in self._footer_labels.values():
             label.destroy()
         self._footer_labels.clear()
@@ -1575,7 +2194,7 @@ class TimestampApp:
         """Build the widget tree for one compact timestamp row (once per entry).
 
         One thin line: status dot · ref+time+state text · label/tag chips ·
-        mini action icons (📷 on timestamps, 🎬 on replays, ✎, ✕). The whole row — frame and
+        mini action icons (📷 and 🎙 on timestamps, 🎬 on replays, ✎, ✕). The whole row — frame and
         every passive child including chips — forwards clicks to the same
         record/stop/play state machine the old full-width button used; only
         the icon buttons are separate click targets. Everything state-
@@ -1603,6 +2222,7 @@ class TimestampApp:
         actions.grid(row=0, column=3, padx=(2, 6), pady=3, sticky="e")
         next_action_column = 0
         shot_button = None
+        take_button = None
         if entry.kind == "replay" and entry.replay_file:
             ctk.CTkButton(
                 actions,
@@ -1631,6 +2251,21 @@ class TimestampApp:
                 state="normal" if entry.screenshot_file else "disabled",
             )
             shot_button.grid(row=0, column=next_action_column, padx=(0, 2))
+            next_action_column += 1
+            # Quick "record another take" for completed entries. Visibility
+            # and look are driven by _update_row_widgets: hidden while
+            # pending/error, ■ Stop while this row captures.
+            take_button = ctk.CTkButton(
+                actions,
+                text="🎙",
+                width=26,
+                height=22,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BTN_SURFACE,
+                hover_color=Theme.BTN_SURFACE_HOVER,
+                command=lambda entry_id=entry_id: self._quick_take(entry_id),
+            )
+            take_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
         ctk.CTkButton(
             actions,
@@ -1666,7 +2301,38 @@ class TimestampApp:
             "meta_frame": meta_frame,
             "meta_signature": None,
             "shot_button": shot_button,
+            "take_button": take_button,
         }
+
+    def _create_header_widgets(self, recording: RecordingInfo | None) -> dict:
+        """Build the widget tree for one section header (once per segment).
+
+        Recording headers carry a small 📼 button that opens the segment's
+        OBS recording video; it starts disabled and stays greyed until the
+        session knows the file path (segments from the in-app timer toggle
+        or older sessions never get one). The "Earlier timestamps" header
+        passes ``None`` and renders label-only.
+        """
+        frame = ctk.CTkFrame(self.timestamp_list, fg_color="transparent")
+        label = ctk.CTkLabel(frame, font=Theme.FONT_SMALL, anchor="w")
+        label.grid(row=0, column=0, padx=12, pady=(8, 1), sticky="w")
+        open_button = None
+        if recording is not None:
+            open_button = ctk.CTkButton(
+                frame,
+                text="📼",
+                width=26,
+                height=20,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BTN_SURFACE,
+                hover_color=Theme.GREEN_HOVER,
+                command=lambda number=recording.number: self._open_recording_video(
+                    number
+                ),
+                state="normal" if recording.path else "disabled",
+            )
+            open_button.grid(row=0, column=1, padx=(6, 0), pady=(8, 1), sticky="w")
+        return {"frame": frame, "label": label, "open_button": open_button}
 
     def _update_row_widgets(self, widgets: dict, entry: TimestampEntry) -> None:
         """Reconfigure a cached row in place to match the entry's current state."""
@@ -1690,6 +2356,29 @@ class TimestampApp:
             shot_button.configure(
                 state="normal" if entry.screenshot_file else "disabled"
             )
+
+        take_button = widgets.get("take_button")
+        if take_button is not None:
+            # Quick-take control: hidden until the entry has saved audio,
+            # turns into ■ Stop while this very row captures.
+            if entry.status == "recording":
+                take_button.grid()
+                take_button.configure(
+                    text="■ Stop",
+                    fg_color=Theme.RED,
+                    hover_color=Theme.RED_HOVER,
+                    state="normal",
+                )
+            elif entry.status == "completed":
+                take_button.grid()
+                take_button.configure(
+                    text="🎙",
+                    fg_color=Theme.BTN_SURFACE,
+                    hover_color=Theme.BTN_SURFACE_HOVER,
+                    state="normal",
+                )
+            else:
+                take_button.grid_remove()
 
         signature = (entry.label, tuple(entry.tags))
         if widgets["meta_signature"] != signature:
@@ -1746,6 +2435,20 @@ class TimestampApp:
             )
             chip.grid(
                 row=0, column=next_column + len(visible_tags), padx=(0, 4), sticky="w"
+            )
+            add_chip(chip)
+        if len(entry.takes) > 1:
+            chip = ctk.CTkLabel(
+                meta_frame,
+                text=f"🎙 {len(entry.takes)} takes",
+                font=Theme.FONT_SMALL,
+                text_color=Theme.TEXT_DIM,
+            )
+            chip.grid(
+                row=0,
+                column=next_column + len(visible_tags) + (1 if hidden_tags > 0 else 0),
+                padx=(0, 4),
+                sticky="w",
             )
             add_chip(chip)
 
@@ -1812,6 +2515,36 @@ class TimestampApp:
         )
         self._on_obs_status_change("connecting")
 
+    def _open_obs_settings(self) -> None:
+        if self._obs_settings_dialog is not None and self._obs_settings_dialog.winfo_exists():
+            try:
+                self._obs_settings_dialog._focus()
+            except tk.TclError:
+                pass
+            return
+        self._obs_settings_dialog = ObsSettingsDialog(self, dict(self.obs_settings), self._apply_obs_settings)
+
+    def _apply_obs_settings(self, new_settings: dict) -> None:
+        self.obs_settings = dict(new_settings)
+        self._save_config()
+        self._set_status(f"OBS settings saved ({self.obs_settings['host']}:{self.obs_settings['port']}).", Theme.BLUE)
+        was_connected = self.obs_manager.is_connected
+        auto = bool(self.obs_settings.get("auto_connect", True))
+        # Tear down with new params, then reconnect per new auto flag.
+        if was_connected:
+            try:
+                self.obs_manager.disconnect()
+            except Exception:
+                pass
+            if auto:
+                self.obs_manager.enable_auto_reconnect(host=self.obs_settings.get("host", "localhost"), port=self.obs_settings.get("port", 4455), password=self.obs_settings.get("password", ""))
+            self.obs_manager.connect(self.obs_settings.get("host", "localhost"), self.obs_settings.get("port", 4455), self.obs_settings.get("password", ""))
+            self._on_obs_status_change("connecting")
+        elif auto:
+            self.obs_manager.enable_auto_reconnect(host=self.obs_settings.get("host", "localhost"), port=self.obs_settings.get("port", 4455), password=self.obs_settings.get("password", ""))
+            self.obs_manager.connect(self.obs_settings.get("host", "localhost"), self.obs_settings.get("port", 4455), self.obs_settings.get("password", ""))
+            self._on_obs_status_change("connecting")
+
     def _toggle_obs_connection(self) -> None:
         if self.obs_manager.is_connected:
             self.obs_manager.disconnect()
@@ -1823,7 +2556,7 @@ class TimestampApp:
 
         def update() -> None:
             if not self._closing:
-                self._start_obs_timer(name)
+                self._start_obs_timer(name, output_path)
 
         try:
             self.root.after(0, update)
@@ -1835,19 +2568,27 @@ class TimestampApp:
 
         def update() -> None:
             if not self._closing:
-                self._stop_obs_timer(name)
+                self._stop_obs_timer(name, output_path)
 
         try:
             self.root.after(0, update)
         except tk.TclError:
             pass
 
-    def _start_obs_timer(self, recording_name: str | None = None) -> None:
+    def _start_obs_timer(
+        self,
+        recording_name: str | None = None,
+        recording_path: str | None = None,
+    ) -> None:
         if not self.session:
             self._update_action_state()
             self._set_status("OBS is recording. Set a project before adding timestamps.", Theme.AMBER)
             return
         self.session.start_timer(recording_name)
+        if recording_path and self.session.current_recording_number is not None:
+            self.session.set_recording_path(
+                self.session.current_recording_number, str(recording_path)
+            )
         self._update_action_state()
         self._schedule_list_refresh()
         segment = f" ({recording_name})" if recording_name else ""
@@ -1856,7 +2597,11 @@ class TimestampApp:
             Theme.GREEN,
         )
 
-    def _stop_obs_timer(self, recording_name: str | None = None) -> None:
+    def _stop_obs_timer(
+        self,
+        recording_name: str | None = None,
+        recording_path: str | None = None,
+    ) -> None:
         # A session that joined mid-recording never learned the file name;
         # the stop event reveals it, so backfill the segment header now.
         if (
@@ -1866,6 +2611,17 @@ class TimestampApp:
         ):
             self.session.name_recording(
                 self.session.current_recording_number, recording_name
+            )
+        # Same for the video path; must run before stop_timer clears the
+        # current segment number. The later event confirms/corrects the
+        # value stored at start.
+        if (
+            self.session
+            and recording_path
+            and self.session.current_recording_number is not None
+        ):
+            self.session.set_recording_path(
+                self.session.current_recording_number, str(recording_path)
             )
         if self.recorder.active and self.recording_entry_id is not None:
             entry = self.session.get(self.recording_entry_id) if self.session else None
@@ -1880,8 +2636,9 @@ class TimestampApp:
     def _update_action_state(self) -> None:
         has_session = bool(self.session)
         timer_running = bool(self.session and self.session.timer_running)
+        is_paused = bool(self.session and getattr(self.session, "timer_paused", False))
         self.new_timestamp_button.configure(
-            state="normal" if timer_running else "disabled"
+            state="normal" if timer_running and not is_paused else "disabled"
         )
         self.manual_timestamp_button.configure(
             state="normal" if has_session else "disabled"
@@ -1892,6 +2649,18 @@ class TimestampApp:
             fg_color=(Theme.RED if timer_running else Theme.GREEN),
             hover_color=(Theme.RED_HOVER if timer_running else Theme.GREEN_HOVER),
         )
+        if timer_running:
+            self.pause_button.grid()
+            obs_drives = bool(self.obs_manager.is_connected and self.obs_manager.is_recording)
+            if is_paused:
+                self.pause_button.configure(text="▶ Resume", fg_color=Theme.GREEN, hover_color=Theme.GREEN_HOVER, state="normal")
+            else:
+                self.pause_button.configure(text="⏸ Pause", fg_color=Theme.GREY if obs_drives else Theme.BTN_SURFACE, hover_color=Theme.GREY_HOVER if obs_drives else Theme.BTN_SURFACE_HOVER, state="disabled" if obs_drives else "normal")
+        else:
+            try:
+                self.pause_button.grid_remove()
+            except tk.TclError:
+                pass
 
     def _on_obs_replay_saved(self, replay_path=None) -> None:
         """Log an OBS replay-buffer save as an entry; marshaled via root.after.
@@ -1943,6 +2712,8 @@ class TimestampApp:
             if self._closing:
                 return
             if status == "connected":
+                self._obs_last_failure_reason = None
+                self._obs_was_up = True
                 self.obs_status_label.configure(text="● OBS connected", text_color=Theme.GREEN)
                 self.obs_connect_button.configure(text="Disconnect")
                 # Surface the replay-buffer state immediately so silent
@@ -1965,22 +2736,48 @@ class TimestampApp:
             elif status == "waiting":
                 # The auto-reconnect watchdog is hunting for OBS. If the
                 # connection died mid-use, finalize any stale recording
-                # exactly like a disconnect would; this status repeats on
-                # every retry cycle, so stay quiet when nothing is active.
-                if (self.session and self.session.timer_running) or self.recorder.active:
-                    self._stop_obs_timer()
-                self.obs_status_label.configure(
-                    text="● Waiting for OBS…", text_color=Theme.AMBER
-                )
+                # exactly like a disconnect would — but ONLY on that one
+                # connected→dropped transition. While OBS is merely
+                # unreachable this status repeats on every retry cycle and
+                # must leave a manual ▶ timer or microphone recording alone.
+                if self._obs_was_up:
+                    self._obs_was_up = False
+                    if (self.session and self.session.timer_running) or self.recorder.active:
+                        self._stop_obs_timer()
+                self.obs_status_label.configure(text="● Waiting for OBS…", text_color=Theme.AMBER)
                 self.obs_connect_button.configure(text="Connect OBS")
+                # Surface the waiting reason once per distinct failure so
+                # "Wrong password" does not hide behind a silent amber dot.
+                # Duplicate "waiting" pulses every ~5 s are otherwise quiet.
             elif status == "disconnected":
-                self._stop_obs_timer()
+                was_up = self._obs_was_up
+                self._obs_was_up = False
+                if was_up:
+                    self._stop_obs_timer()
                 self.obs_status_label.configure(text="● OBS disconnected", text_color=Theme.RED)
                 self.obs_connect_button.configure(text="Connect OBS")
+            elif status.startswith("auth_error:"):
+                self._obs_was_up = False
+                reason = status[11:].strip()
+                if reason != self._obs_last_failure_reason:
+                    self._obs_last_failure_reason = reason
+                    self.obs_status_label.configure(text="● OBS auth failed", text_color=Theme.RED)
+                    self.obs_connect_button.configure(text="Connect OBS")
+                    self._set_status(f"OBS refused the password — click ⚙ to edit connection settings. ({reason})", Theme.RED)
+                else:
+                    self.obs_status_label.configure(text="● OBS auth failed", text_color=Theme.RED)
+                    self.obs_connect_button.configure(text="Connect OBS")
             elif status.startswith("error:"):
-                self.obs_status_label.configure(text="● OBS error", text_color=Theme.RED)
-                self.obs_connect_button.configure(text="Connect OBS")
-                self._set_status(status[6:], Theme.RED)
+                self._obs_was_up = False
+                reason = status[6:].strip()
+                if reason != self._obs_last_failure_reason:
+                    self._obs_last_failure_reason = reason
+                    self.obs_status_label.configure(text="● OBS error", text_color=Theme.RED)
+                    self.obs_connect_button.configure(text="Connect OBS")
+                    self._set_status(reason, Theme.RED)
+                else:
+                    self.obs_status_label.configure(text="● OBS error", text_color=Theme.RED)
+                    self.obs_connect_button.configure(text="Connect OBS")
 
         try:
             self.root.after(0, update)
@@ -2103,10 +2900,12 @@ class TimestampApp:
         elapsed = self.session.elapsed_seconds() if self.session else 0.0
         self.clock_label.configure(text=format_elapsed_display(elapsed))
         current = self.session.current_recording if self.session else None
+        is_paused = bool(self.session and getattr(self.session, "timer_paused", False))
         if self.session and self.session.timer_running and current is not None:
-            self.rec_indicator_label.configure(
-                text=f"● REC {current.number}", text_color=Theme.GREEN
-            )
+            if is_paused:
+                self.rec_indicator_label.configure(text=f"● PAUSED {current.number}", text_color=Theme.AMBER)
+            else:
+                self.rec_indicator_label.configure(text=f"● REC {current.number}", text_color=Theme.GREEN)
         else:
             self.rec_indicator_label.configure(text="")
         self.root.after(500, self._update_clock)
@@ -2614,6 +3413,104 @@ class TagManagerDialog(OverlayDialog):
                 pass
 
 
+class ObsSettingsDialog(OverlayDialog):
+    """Modal dialog to edit OBS WebSocket connection settings."""
+
+    def __init__(self, app, obs_settings: dict, on_save) -> None:
+        super().__init__(app, 380, 360)
+        self._on_save = on_save
+        header = ctk.CTkFrame(self.card, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(14, 4))
+        ctk.CTkLabel(
+            header, text="OBS connection", font=Theme.FONT_SUBTITLE,
+            text_color=Theme.TEXT_BRIGHT, anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            header, text="✕", width=28, height=28, font=Theme.FONT_SMALL,
+            fg_color=Theme.BTN_SURFACE, hover_color=Theme.RED_HOVER, command=self.destroy
+        ).pack(side="right")
+        ctk.CTkLabel(
+            self.card,
+            text="Host, port, and password for OBS WebSocket (Tools → WebSocket Server Settings).",
+            font=Theme.FONT_SMALL, text_color=Theme.TEXT_DIM, anchor="w", wraplength=340, justify="left",
+        ).pack(fill="x", padx=18, pady=(0, 10))
+        # Host
+        ctk.CTkLabel(self.card, text="Host", font=Theme.FONT_SMALL, text_color=Theme.TEXT_DIM, anchor="w").pack(fill="x", padx=18)
+        self.host_entry = ctk.CTkEntry(self.card, font=Theme.FONT_BODY, placeholder_text="localhost")
+        self.host_entry.insert(0, str(obs_settings.get("host", "localhost")))
+        self.host_entry.pack(fill="x", padx=18, pady=(2, 8))
+        # Port
+        ctk.CTkLabel(self.card, text="Port", font=Theme.FONT_SMALL, text_color=Theme.TEXT_DIM, anchor="w").pack(fill="x", padx=18)
+        self.port_entry = ctk.CTkEntry(self.card, font=Theme.FONT_BODY, placeholder_text="4455")
+        self.port_entry.insert(0, str(obs_settings.get("port", 4455)))
+        self.port_entry.pack(fill="x", padx=18, pady=(2, 8))
+        # Password
+        ctk.CTkLabel(self.card, text="Password (leave empty if none)", font=Theme.FONT_SMALL, text_color=Theme.TEXT_DIM, anchor="w").pack(fill="x", padx=18)
+        pw_row = ctk.CTkFrame(self.card, fg_color="transparent")
+        pw_row.pack(fill="x", padx=18, pady=(2, 4))
+        self.password_entry = ctk.CTkEntry(pw_row, font=Theme.FONT_BODY, placeholder_text="Password", show="•")
+        self.password_entry.insert(0, str(obs_settings.get("password", "")))
+        self.password_entry.pack(side="left", fill="x", expand=True)
+        self._pw_visible = False
+        ctk.CTkButton(pw_row, text="Show", width=56, height=28, font=Theme.FONT_SMALL, fg_color=Theme.BTN_SURFACE, hover_color=Theme.BTN_SURFACE_HOVER, command=self._toggle_pw).pack(side="left", padx=(6, 0))
+        self._show_btn = pw_row.winfo_children()[-1]
+        # Auto-connect
+        self.auto_var = tk.BooleanVar(value=bool(obs_settings.get("auto_connect", True)))
+        self.auto_check = ctk.CTkCheckBox(self.card, text="Auto-connect & reconnect", variable=self.auto_var, font=Theme.FONT_SMALL, text_color=Theme.TEXT_BRIGHT)
+        self.auto_check.pack(anchor="w", padx=18, pady=(10, 4))
+        self.feedback_label = ctk.CTkLabel(self.card, text="", font=Theme.FONT_SMALL, text_color=Theme.RED, anchor="w", wraplength=340, justify="left")
+        self.feedback_label.pack(fill="x", padx=18, pady=(4, 0))
+        btns = ctk.CTkFrame(self.card, fg_color="transparent")
+        btns.pack(fill="x", padx=18, pady=(10, 16))
+        btns.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(btns, text="Save", width=100, font=Theme.FONT_BUTTON, fg_color=Theme.GREEN, hover_color=Theme.GREEN_HOVER, text_color="#000000", command=self._save).grid(row=0, column=1, padx=(8, 0))
+        ctk.CTkButton(btns, text="Cancel", width=100, font=Theme.FONT_BUTTON, fg_color=Theme.GREY, hover_color=Theme.GREY_HOVER, command=self._close).grid(row=0, column=0, sticky="e")
+        self.after(60, self._focus)
+
+    def _focus(self) -> None:
+        try:
+            self.lift(); self.card.lift(); self.grab_set(); self.host_entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def on_escape(self) -> None:
+        self._close()
+
+    def _close(self) -> None:
+        try:
+            self.app._obs_settings_dialog = None
+        except Exception:
+            pass
+        self.destroy()
+
+    def destroy(self) -> None:
+        try:
+            self.app._obs_settings_dialog = None
+        except Exception:
+            pass
+        super().destroy()
+
+    def _toggle_pw(self) -> None:
+        self._pw_visible = not self._pw_visible
+        self.password_entry.configure(show="" if self._pw_visible else "•")
+        self._show_btn.configure(text="Hide" if self._pw_visible else "Show")
+
+    def _save(self) -> None:
+        host = self.host_entry.get().strip() or "localhost"
+        port_text = self.port_entry.get().strip() or "4455"
+        try:
+            port = int(port_text)
+            if not 1 <= port <= 65535:
+                raise ValueError()
+        except ValueError:
+            self.feedback_label.configure(text="Port must be 1–65535.")
+            return
+        password = self.password_entry.get()
+        auto = bool(self.auto_var.get())
+        self.destroy()
+        self._on_save({"host": host, "port": port, "password": password, "auto_connect": auto})
+
+
 class TimestampEditDialog(OverlayDialog):
     """Modal dialog to set a timestamp's label and preset tags."""
 
@@ -2625,14 +3522,18 @@ class TimestampEditDialog(OverlayDialog):
         on_save,
         on_manage_tags=None,
     ):
-        super().__init__(app, 440, 360)
+        super().__init__(app, 440, 540)
 
         self._on_save = on_save
+        self._entry_id = entry.id
+        self._recording_in_dialog = False
         self._definitions = list(tag_definitions)
         self._selected_tags: set[str] = {tag.lower() for tag in entry.tags}
 
+        header = ctk.CTkFrame(self.card, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(16, 10))
         ctk.CTkLabel(
-            self.card,
+            header,
             text=(
                 f"Timestamp {format_entry_ref(entry)} — "
                 f"{format_elapsed_display(entry.elapsed_seconds)}"
@@ -2640,7 +3541,20 @@ class TimestampEditDialog(OverlayDialog):
             font=Theme.FONT_SUBTITLE,
             text_color=Theme.TEXT_BRIGHT,
             anchor="w",
-        ).pack(fill="x", padx=18, pady=(16, 10))
+        ).pack(side="left", fill="x", expand=True)
+        has_screenshot = bool(entry.screenshot_file) and entry.kind != "replay"
+        self.screenshot_button = ctk.CTkButton(
+            header,
+            text="\U0001F4F7 Screenshot",
+            width=118,
+            height=22,
+            font=Theme.FONT_SMALL,
+            fg_color=Theme.BTN_SURFACE,
+            hover_color=Theme.BLUE_HOVER,
+            command=lambda: self.app._open_screenshot(self._entry_id),
+            state="normal" if has_screenshot else "disabled",
+        )
+        self.screenshot_button.pack(side="right")
 
         ctk.CTkLabel(
             self.card,
@@ -2654,7 +3568,13 @@ class TimestampEditDialog(OverlayDialog):
         )
         if entry.label:
             self.label_entry.insert(0, entry.label)
-        self.label_entry.pack(fill="x", padx=18, pady=(4, 12))
+        self.label_entry.pack(fill="x", padx=18, pady=(4, 6))
+        ctk.CTkLabel(self.card, text="Time (HH:MM:SS, MM:SS, or SS)", font=Theme.FONT_SMALL, text_color=Theme.TEXT_DIM, anchor="w").pack(fill="x", padx=18, pady=(4, 0))
+        self.time_entry = ctk.CTkEntry(self.card, font=Theme.FONT_BODY, placeholder_text=format_elapsed_display(entry.elapsed_seconds))
+        self.time_entry.insert(0, format_elapsed_display(entry.elapsed_seconds))
+        self.time_entry.pack(fill="x", padx=18, pady=(2, 0))
+        self.time_feedback = ctk.CTkLabel(self.card, text="", font=Theme.FONT_SMALL, text_color=Theme.RED, anchor="w")
+        self.time_feedback.pack(fill="x", padx=18, pady=(0, 4))
         self.label_entry.focus_set()
 
         tags_header = ctk.CTkFrame(self.card, fg_color="transparent")
@@ -2667,7 +3587,7 @@ class TimestampEditDialog(OverlayDialog):
             anchor="w",
         ).pack(side="left")
         if on_manage_tags is not None:
-            ctk.CTkButton(
+            self._new_tag_button = ctk.CTkButton(
                 tags_header,
                 text="＋ New tag",
                 width=92,
@@ -2676,15 +3596,39 @@ class TimestampEditDialog(OverlayDialog):
                 fg_color=Theme.BTN_SURFACE,
                 hover_color=Theme.BTN_SURFACE_HOVER,
                 command=on_manage_tags,
-            ).pack(side="right")
+            )
+            self._new_tag_button.pack(side="right")
+        else:
+            self._new_tag_button = None
         self._chips_frame = ctk.CTkFrame(self.card, fg_color="transparent")
-        self._chips_frame.pack(fill="x", padx=14, pady=(4, 12))
+        self._chips_frame.pack(fill="x", padx=14, pady=(2, 6))
         self._build_chips()
 
+        # ── Audio takes ───────────────────────────────────────────────────
+        takes_header = ctk.CTkFrame(self.card, fg_color="transparent")
+        takes_header.pack(fill="x", padx=18, pady=(2, 0))
+        ctk.CTkLabel(
+            takes_header,
+            text="Audio takes",
+            font=Theme.FONT_SMALL,
+            text_color=Theme.TEXT_DIM,
+            anchor="w",
+        ).pack(side="left")
+        self.rerecord_button = ctk.CTkButton(
+            takes_header,
+            text="🎙 Re-record",
+            width=104,
+            height=22,
+            font=Theme.FONT_SMALL,
+            fg_color=Theme.BTN_SURFACE,
+            hover_color=Theme.BTN_SURFACE_HOVER,
+            command=self._toggle_rerecord,
+        )
+        self.rerecord_button.pack(side="right")
         buttons = ctk.CTkFrame(self.card, fg_color="transparent")
-        buttons.pack(fill="x", padx=18, pady=(2, 16))
+        buttons.pack(side="bottom", fill="x", padx=18, pady=(8, 12))
         buttons.grid_columnconfigure(0, weight=1)
-        ctk.CTkButton(
+        self.save_button = ctk.CTkButton(
             buttons,
             text="Save",
             width=100,
@@ -2693,8 +3637,9 @@ class TimestampEditDialog(OverlayDialog):
             hover_color=Theme.GREEN_HOVER,
             text_color="#000000",
             command=self._save,
-        ).grid(row=0, column=1, padx=(8, 0))
-        ctk.CTkButton(
+        )
+        self.save_button.grid(row=0, column=1, padx=(8, 0))
+        self.cancel_button = ctk.CTkButton(
             buttons,
             text="Cancel",
             width=100,
@@ -2702,7 +3647,14 @@ class TimestampEditDialog(OverlayDialog):
             fg_color=Theme.GREY,
             hover_color=Theme.GREY_HOVER,
             command=self._cancel,
-        ).grid(row=0, column=0, sticky="e")
+        )
+        self.cancel_button.grid(row=0, column=0, sticky="e")
+
+        self._takes_frame = ctk.CTkScrollableFrame(
+            self.card, height=110, fg_color="transparent"
+        )
+        self._takes_frame.pack(fill="both", expand=True, padx=14, pady=(4, 8))
+        self._build_takes_rows()
 
         self.after(60, self._focus)
 
@@ -2751,6 +3703,15 @@ class TimestampEditDialog(OverlayDialog):
         self._definitions = [dict(tag) for tag in tag_definitions]
         self._build_chips()
 
+    def refresh_screenshot_state(self) -> None:
+        """Enable the header screenshot button once the async capture lands."""
+        try:
+            entry = self._current_entry()
+            has_shot = bool(entry and entry.screenshot_file and entry.kind != "replay")
+            self.screenshot_button.configure(state="normal" if has_shot else "disabled")
+        except (tk.TclError, AttributeError):
+            pass
+
     def _apply_chip_state(self, chip: ctk.CTkButton, name: str, color: str) -> None:
         selected = name.lower() in self._selected_tags
         if selected:
@@ -2774,13 +3735,203 @@ class TimestampEditDialog(OverlayDialog):
                 chosen.append(name)
         return chosen
 
+    # ── Audio takes ──────────────────────────────────────────────────────
+
+    def _current_entry(self) -> TimestampEntry | None:
+        session = getattr(self.app, "session", None)
+        return session.get(self._entry_id) if session else None
+
+    def _take_list(self) -> list[dict]:
+        """Takes of the entry; pre-takes entries synthesize their single one."""
+        entry = self._current_entry()
+        if entry is None:
+            return []
+        if entry.takes:
+            return list(entry.takes)
+        if entry.audio_file:
+            return [
+                {
+                    "file": entry.audio_file,
+                    "duration_seconds": entry.duration_seconds,
+                    "created_at": "",
+                }
+            ]
+        return []
+
+    def _build_takes_rows(self) -> None:
+        for child in self._takes_frame.winfo_children():
+            child.destroy()
+        takes = self._take_list()
+        if not takes:
+            ctk.CTkLabel(
+                self._takes_frame,
+                text="No audio yet — click the timestamp row to record the first take.",
+                font=Theme.FONT_SMALL,
+                text_color=Theme.TEXT_DIM,
+                anchor="w",
+            ).pack(fill="x", padx=4, pady=6)
+            return
+        session = getattr(self.app, "session", None)
+        output_dir = session.output_dir if session else ""
+        playing_path = (
+            os.path.abspath(self.app.playback.current_path)
+            if self.app.playback.current_path
+            else None
+        )
+        entry = self._current_entry()
+        active_file = (entry.audio_file if entry else None) or ""
+        # Newest take first.
+        for index in range(len(takes) - 1, -1, -1):
+            take = takes[index]
+            relative = str(take.get("file") or "")
+            duration = take.get("duration_seconds")
+            row = ctk.CTkFrame(
+                self._takes_frame, fg_color=Theme.BTN_SURFACE, corner_radius=6
+            )
+            row.pack(fill="x", padx=2, pady=3)
+            is_active = relative == active_file
+            marker = "● " if is_active else ""
+            ctk.CTkLabel(
+                row,
+                text=f"{marker}Take {index + 1}",
+                font=Theme.FONT_SMALL,
+                text_color=Theme.GREEN if is_active else Theme.TEXT_BRIGHT,
+                width=78,
+                anchor="w",
+            ).pack(side="left", padx=(8, 0))
+            length = f"{duration:.1f}s" if duration else "—"
+            ctk.CTkLabel(
+                row,
+                text=length,
+                font=Theme.FONT_SMALL,
+                text_color=Theme.TEXT_DIM,
+                width=46,
+                anchor="w",
+            ).pack(side="left")
+            actions = ctk.CTkFrame(row, fg_color="transparent")
+            actions.pack(side="right", padx=6)
+            play_icon = "▶"
+            if playing_path and output_dir:
+                try:
+                    full = os.path.abspath(os.path.join(output_dir, relative))
+                    if full == playing_path:
+                        play_icon = "■"
+                except OSError:
+                    pass
+            ctk.CTkButton(
+                actions,
+                text=play_icon,
+                width=32,
+                height=22,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BTN_SURFACE,
+                hover_color=Theme.BTN_SURFACE_HOVER,
+                command=lambda i=index: self.app._toggle_take_playback(
+                    self._entry_id, i, self.refresh_takes
+                ),
+            ).pack(side="left", padx=2)
+            if not is_active:
+                ctk.CTkButton(
+                    actions,
+                    text="★ Use",
+                    width=52,
+                    height=22,
+                    font=Theme.FONT_SMALL,
+                    fg_color=Theme.BTN_SURFACE,
+                    hover_color=Theme.BTN_SURFACE_HOVER,
+                    text_color=Theme.TEXT_BRIGHT,
+                    command=lambda i=index: self.app._dialog_set_active_take(
+                        self._entry_id, i, self
+                    ),
+                ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                actions,
+                text="🗑",
+                width=32,
+                height=22,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BTN_SURFACE,
+                hover_color=Theme.RED_HOVER,
+                text_color=Theme.TEXT_BRIGHT,
+                command=lambda i=index: self.app._dialog_delete_take(
+                    self._entry_id, i, self
+                ),
+            ).pack(side="left", padx=(2, 0))
+
+    def refresh_takes(self, _entry=None) -> None:
+        """Rebuild the take rows after a record/delete/switch."""
+        try:
+            self._build_takes_rows()
+        except tk.TclError:
+            pass
+
+    def enter_recording_mode(self) -> None:
+        """Lock the form while an in-dialog re-record captures audio."""
+        self._recording_in_dialog = True
+        self._set_form_locked(True)
+
+    def exit_recording_mode(self) -> None:
+        self._recording_in_dialog = False
+        self._set_form_locked(False)
+
+    def _set_form_locked(self, locked: bool) -> None:
+        state = "disabled" if locked else "normal"
+        for widget in (
+            self.label_entry,
+            self.time_entry,
+            self.save_button,
+            self.cancel_button,
+            self._new_tag_button,
+        ):
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+        for chip in self._chips_frame.winfo_children():
+            try:
+                chip.configure(state=state)
+            except tk.TclError:
+                pass
+        try:
+            if locked:
+                self.rerecord_button.configure(
+                    text="■ Stop",
+                    fg_color=Theme.RED,
+                    hover_color=Theme.RED_HOVER,
+                )
+            else:
+                self.rerecord_button.configure(
+                    text="🎙 Re-record",
+                    fg_color=Theme.BTN_SURFACE,
+                    hover_color=Theme.BTN_SURFACE_HOVER,
+                )
+        except tk.TclError:
+            pass
+
+    def _toggle_rerecord(self) -> None:
+        if self._recording_in_dialog:
+            self.app._dialog_rerecord_stop(self._entry_id, self)
+        else:
+            self.app._dialog_rerecord_start(self._entry_id, self)
+
     def _save(self) -> None:
+        time_text = self.time_entry.get().strip()
+        seconds = parse_time_input(time_text) if time_text else None
+        if time_text and seconds is None:
+            self.time_feedback.configure(text="Enter time as SS, MM:SS, or HH:MM:SS.")
+            return
         label = self.label_entry.get()
+        tags = self._selected_tag_names()
         on_save = self._on_save
+        pending_time = seconds
         self.destroy()
-        on_save(label, self._selected_tag_names())
+        on_save(label, tags, pending_time)
 
     def _cancel(self) -> None:
+        # Closing mid-re-record is allowed on purpose: the entry stays in its
+        # recording state, so clicking the timestamp row stops the capture.
         self.destroy()
 
 

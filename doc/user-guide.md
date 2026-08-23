@@ -52,13 +52,25 @@ If OBS starts while the manual timer already runs, the live segment simply conti
 5. Click the recording row again to stop and save the WAV file.
 6. Click the completed row to play or stop the recording.
 
+While a recording runs, a small 🎤 level bar appears beside the status bar so you can see the microphone is actually picking you up. If no audio comes through at all, the app stops the capture by itself, throws the silent take away, and shows **No microphone input detected — check the selected mic and try again.** A first recording goes back to its grey record-me state; an aborted retake on an already-saved timestamp keeps its previous audio and stays green. The threshold and timeout are adjustable under `mic_settings` in `keybinds.json` (see [configuration.md](configuration.md)).
+
 When the timer stops — from OBS or the in-app button — the app finalizes an active note and locks only *creating new* timestamps. Existing rows stay usable: pending notes can still record audio and saved notes play back anytime.
 
 ### Reading the timestamp list
 
-Each timestamp is one compact row. A colored dot shows the state: grey pending, red recording (or error), green saved, blue while playing, violet for replay entries. The row itself is the button — clicking anywhere on it records, stops, or plays exactly as before. After the `R##-###` reference and time you'll see the entry's label in quotes and up to three tag chips (more tags collapse into a `+N` chip). The small icons at the end open the timestamp's screenshot (📷, timestamps only), open the replay video (🎬, replays only), edit label/tags (✎), and delete the entry (✕). The **📷** icon stays greyed out until the snapshot has finished saving (and on older entries created before screenshots existed); if the JPEG was moved or deleted, clicking it shows an error in the status bar instead.
+Each timestamp is one compact row. A colored dot shows the state: grey pending, red recording (or error), green saved, blue while playing, violet for replay entries. The row itself is the button — clicking anywhere on it records, stops, or plays exactly as before. After the `R##-###` reference and time you'll see the entry's label in quotes and up to three tag chips (more tags collapse into a `+N` chip). The small icons at the end open the timestamp's screenshot (📷, timestamps only), record another take (🎙, completed timestamps only — see *Retakes* below), open the replay video (🎬, replays only), edit label/tags (✎), and delete the entry (✕). The **📷** icon stays greyed out until the snapshot has finished saving (and on older entries created before screenshots existed); if the JPEG was moved or deleted, clicking it shows an error in the status bar instead.
 
 The list follows you while you work: as long as you're already near the bottom, every new timestamp (hotkey, ＋ button, manual entry, or OBS replay save) scrolls itself into view. Scroll up to read older entries and it stops following — scroll back down and it picks up where it left off. Opening or switching a project always lands you on the latest segment.
+
+## Retakes: multiple takes per timestamp
+
+A saved note is never final. Every timestamp can hold several **takes**; the newest one is active, and earlier ones stay on disk:
+
+- Completed timestamps show a quick **🎙** icon right on the row: one click starts recording the next take without opening any dialog — the row turns red as usual and clicking the row or its **■ Stop** button saves the file as the new active take. If another recording is already running you get an amber "Stop the current timestamp recording first" hint instead.
+- Alternatively, click **✎** on a completed timestamp to open the edit dialog's **Audio takes** section. Press **🎙 Re-record** to record a new take right there — the button turns into **■ Stop** and the rest of the dialog locks while you speak. Stopping saves the new file as the active take and rebuilds the list; closing the dialog mid-recording is also fine, then clicking the row stops it as usual.
+- Each take row offers **▶** to audition it and, on non-active takes, **★ Use** to make it the headline audio again. **🗑** permanently deletes a single take (with confirmation); deleting the last take returns the timestamp to its grey record-me state.
+- Rows show a `🎙 N takes` chip once a timestamp has more than one take, and the Markdown log lists the non-active takes as indented links below the entry.
+- File names stay unique (`R01-001_00-12-34.wav`, `_2`, `_3`, …), so retaking never overwrites old audio.
 
 ## Replay-buffer saves
 
@@ -77,7 +89,7 @@ The Markdown log shows each replay with its name and a `Footage:` link straight 
 
 - **Label and tags**: click **✎** on any timestamp to open a dialog with an optional short label and tag chips (defaults: `kill`, `bug`, `idea`). Labels and tags appear in the timestamp list and in the Markdown log as `"label" #tag`. The actively recording row cannot be edited.
 - **Tag library**: click **🏷 Tags** in the header — or **＋ New tag** inside the timestamp edit dialog — to open the tag manager. Add tags (name plus a palette or custom color), rename, recolor, or delete them; names are capped at 24 characters and must be unique. Renaming a tag updates it on every timestamp in the open project (list, Markdown log, and `session.json`); deleting a tag that timestamps use asks for confirmation first and then strips it from them. Changes are saved to `keybinds.json` immediately, and the edit dialog's chips refresh live while the manager is open.
-- **Delete**: click **✕** and confirm. The entry is removed from the list, Markdown, and `session.json`, and its WAV file and screenshot are deleted from disk; if a file cannot be deleted (for example it is still open in another program) it stays put and the status bar says so. The actively recording row cannot be deleted.
+- **Delete**: click **✕** and confirm. The entry is removed from the list, Markdown, and `session.json`, and every audio take plus the screenshot are deleted from disk; if a file cannot be deleted (for example it is still open in another program) it stays put and the status bar says so. The actively recording row cannot be deleted.
 - **Manual timestamps**: click **＋ Manual** while a project is open — even when OBS is stopped — and type a time position as SS, MM:SS, or HH:MM:SS. The entry is created at that position so you can attach a note afterwards for a moment you missed live.
 - **Tag storage**: the library lives in `keybinds.json` under `tags` as `{"name": ..., "color": "#RRGGBB"}` entries and is shared across projects; see [configuration.md](configuration.md). Hand-editing works too, but the dialog is the normal way.
 

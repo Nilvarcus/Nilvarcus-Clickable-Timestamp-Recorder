@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import struct
 import sys
 import subprocess
 import threading
@@ -31,6 +32,13 @@ DEFAULT_TAG_COLOR = "#616161"
 AUDIO_SAMPLE_RATE = 44_100
 AUDIO_CHANNELS = 1
 AUDIO_SAMPLE_WIDTH = 2  # signed 16-bit PCM
+# Silence detection defaults: int16 RMS below ``threshold`` counts as
+# "no voice"; a recording that stays voiceless for ``timeout`` seconds is
+# auto-stopped and discarded. Both are overridable in keybinds.json.
+MIC_SILENCE_THRESHOLD_DEFAULT = 250.0
+MIC_SILENCE_TIMEOUT_DEFAULT = 5.0
+# Meter full scale: RMS mapped to this many int16 counts reads as 1.0.
+MIC_LEVEL_CLAMP_RMS = 5000.0
 
 
 def format_elapsed(seconds: float) -> str:
@@ -291,22 +299,28 @@ class RecordingInfo:
     A segment opens when OBS starts recording and closes when it stops. Its
     name is derived from the recording file name OBS reports (for example
     "[21-08][14-55-19]"), or falls back to a generic label while unknown.
+    ``path`` keeps the absolute recording video path OBS reported so the GUI
+    can open the file; segments recorded without OBS (in-app timer toggle)
+    or by older app versions stay without one.
     """
 
     number: int
     name: Optional[str]
     started_at: float
     ended_at: Optional[float] = None
+    path: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "RecordingInfo":
         raw_name = data.get("name")
         raw_ended = data.get("ended_at")
+        raw_path = data.get("path")
         return cls(
             number=int(data["number"]),
             name=str(raw_name) if raw_name else None,
             started_at=float(data["started_at"]),
             ended_at=float(raw_ended) if raw_ended is not None else None,
+            path=str(raw_path) if raw_path else None,
         )
 
     def header(self) -> str:
@@ -344,6 +358,10 @@ class TimestampEntry:
     recording_index: Optional[int] = None
     transcript: Optional[str] = None
     replay_file: Optional[str] = None
+    # Audio retakes, oldest first. Each item is {file, duration_seconds,
+    # created_at}; ``audio_file``/``duration_seconds`` above always point at
+    # the ACTIVE take (the newest one unless set_active_take chose another).
+    takes: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> "TimestampEntry":
@@ -380,7 +398,51 @@ class TimestampEntry:
             ),
             transcript=clean_transcript(data.get("transcript")),
             replay_file=data.get("replay_file"),
+            takes=cls._takes_from_dict(data),
         )
+
+    @staticmethod
+    def _takes_from_dict(data: dict) -> list[dict]:
+        """Parse persisted retakes tolerantly.
+
+        Session files written before takes existed have no ``takes`` key;
+        entries that already carry audio get one synthesized take so every
+        loaded entry exposes a consistent take list (and re-saving migrates
+        old files naturally).
+        """
+        raw = data.get("takes")
+        takes: list[dict] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                file_value = item.get("file")
+                if not file_value:
+                    continue
+                duration = item.get("duration_seconds")
+                created_at = item.get("created_at")
+                takes.append(
+                    {
+                        "file": str(file_value),
+                        "duration_seconds": (
+                            float(duration) if duration is not None else None
+                        ),
+                        "created_at": str(created_at) if created_at else "",
+                    }
+                )
+        audio_file = data.get("audio_file")
+        if not takes and audio_file:
+            duration = data.get("duration_seconds")
+            takes.append(
+                {
+                    "file": str(audio_file),
+                    "duration_seconds": (
+                        float(duration) if duration is not None else None
+                    ),
+                    "created_at": str(data.get("created_at") or ""),
+                }
+            )
+        return takes
 
     def annotation_suffix(self) -> str:
         """Return the ' — "label" #tag' Markdown suffix, empty when unannotated."""
@@ -405,6 +467,8 @@ class TimestampSession:
         self.project_name = project_name.strip()
         self.started_at = time.time()
         self.timer_running = False
+        self.timer_paused = False
+        self._pause_started_at: Optional[float] = None
         self.entries: list[TimestampEntry] = []
         self.next_id = 1
         self.recordings: list[RecordingInfo] = []
@@ -417,6 +481,8 @@ class TimestampSession:
     def elapsed_seconds(self) -> float:
         if not self.timer_running:
             return 0.0
+        if self.timer_paused and self._pause_started_at is not None:
+            return max(0.0, self._pause_started_at - self.started_at)
         return max(0.0, time.time() - self.started_at)
 
     @property
@@ -436,6 +502,8 @@ class TimestampSession:
         if not self.timer_running:
             self.started_at = time.time()
             self.timer_running = True
+            self.timer_paused = False
+            self._pause_started_at = None
             recording = RecordingInfo(
                 number=self.next_recording_number,
                 name=recording_name or None,
@@ -446,10 +514,28 @@ class TimestampSession:
             self.next_recording_number += 1
             self.save()
 
+    def pause_timer(self) -> None:
+        """Pause the manual timer; timestamp offsets freeze until resume."""
+        if self.timer_running and not self.timer_paused:
+            self.timer_paused = True
+            self._pause_started_at = time.time()
+            self.save()
+
+    def resume_timer(self) -> None:
+        """Resume a paused manual timer, shifting the epoch by the paused duration."""
+        if self.timer_running and self.timer_paused and self._pause_started_at is not None:
+            paused_duration = time.time() - self._pause_started_at
+            self.started_at += paused_duration
+            self.timer_paused = False
+            self._pause_started_at = None
+            self.save()
+
     def stop_timer(self) -> None:
         """Lock timestamp creation until the next OBS recording starts."""
         if self.timer_running:
             self.timer_running = False
+            self.timer_paused = False
+            self._pause_started_at = None
             current = self.current_recording
             if current is not None and current.ended_at is None:
                 current.ended_at = time.time()
@@ -463,6 +549,20 @@ class TimestampSession:
         if recording is None or not cleaned or recording.name == cleaned:
             return
         recording.name = cleaned
+        self.save()
+
+    def set_recording_path(self, number: int, path: str) -> None:
+        """Backfill a segment's OBS recording video path once it is known.
+
+        The start and stop record events both carry the output path; the
+        later event confirms (or corrects) the stored value. Unknown segment
+        numbers and empty paths are safe no-ops.
+        """
+        recording = self._get_recording(number)
+        cleaned = (path or "").strip()
+        if recording is None or not cleaned or recording.path == cleaned:
+            return
+        recording.path = cleaned
         self.save()
 
     def _attach_to_segment(self, entry: TimestampEntry) -> None:
@@ -554,9 +654,9 @@ class TimestampSession:
     @staticmethod
     def _unique_path(candidate: str, suffix: int = 2) -> str:
         """Return candidate, or candidate with an appended _N suffix."""
+        base_root, base_ext = os.path.splitext(candidate)
         while os.path.exists(candidate):
-            root, extension = os.path.splitext(candidate)
-            candidate = f"{root}_{suffix}{extension}"
+            candidate = f"{base_root}_{suffix}{base_ext}"
             suffix += 1
         return candidate
 
@@ -578,11 +678,34 @@ class TimestampSession:
         entry.error = None
         self.save()
 
-    def mark_completed(self, entry: TimestampEntry, audio_path: str, duration: float) -> None:
+    def mark_completed(
+        self, entry: TimestampEntry, audio_path: str, duration: float
+    ) -> None:
+        """Finish a recording; the saved file is registered as the active take.
+
+        Works for both first recordings and re-records: each completed capture
+        is appended to ``takes`` (deduplicated by path) and becomes the entry's
+        active audio, leaving earlier takes playable via the edit dialog.
+        """
+        relative = os.path.relpath(audio_path, self.output_dir)
         entry.status = "completed"
-        entry.audio_file = os.path.relpath(audio_path, self.output_dir)
+        entry.audio_file = relative
         entry.duration_seconds = max(0.0, float(duration))
         entry.error = None
+        registered = False
+        for take in entry.takes:
+            if take.get("file") == relative:
+                take["duration_seconds"] = entry.duration_seconds
+                registered = True
+                break
+        if not registered:
+            entry.takes.append(
+                {
+                    "file": relative,
+                    "duration_seconds": entry.duration_seconds,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         self.save()
 
     def mark_error(self, entry: TimestampEntry, error: str) -> None:
@@ -591,9 +714,111 @@ class TimestampSession:
         self.save()
 
     def reset_for_retry(self, entry: TimestampEntry) -> None:
-        entry.status = "pending"
+        """Make an aborted capture clickable again.
+
+        An entry that already owns takes (a re-record or quick-take attempt
+        on a completed timestamp) returns to ``completed`` instead of
+        regressing to pending: ``mark_recording`` never touches the active
+        take fields, so the previous audio simply stays valid. Entries
+        without takes go back to ``pending`` as before.
+        """
+        entry.status = "completed" if entry.takes else "pending"
         entry.error = None
         self.save()
+
+    def _take_at(self, entry: TimestampEntry, index: int) -> dict:
+        if not 0 <= index < len(entry.takes):
+            raise IndexError(f"Take {index + 1} does not exist")
+        return entry.takes[index]
+
+    def _unlink_project_file(self, relative: str) -> Optional[str]:
+        """Best-effort delete of an output-dir-relative media file.
+
+        Returns a human-readable problem string when the file had to stay on
+        disk (outside the project folder, locked); None when it was deleted
+        or was already gone. Hand-edited session.json must not make us unlink
+        arbitrary files outside the project folder.
+        """
+        base = os.path.normcase(os.path.abspath(self.output_dir)) + os.sep
+        path = os.path.abspath(os.path.join(self.output_dir, relative))
+        if not os.path.normcase(path).startswith(base):
+            return f"{relative}: outside the project folder, left untouched"
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return f"{relative}: {exc}"
+        return None
+
+    def _recycle_project_file(self, relative: str) -> Optional[str]:
+        """Move an output-dir-relative media file to the Recycle Bin.
+
+        Returns a problem string when the file could not be recycled
+        (outside project, locked, missing send2trash); None when recycled
+        or already gone. Falls back to os.remove when send2trash is absent.
+        """
+        base = os.path.normcase(os.path.abspath(self.output_dir)) + os.sep
+        path = os.path.abspath(os.path.join(self.output_dir, relative))
+        if not os.path.normcase(path).startswith(base):
+            return f"{relative}: outside the project folder, left untouched"
+        if not os.path.exists(path):
+            return None
+        try:
+            from send2trash import send2trash
+            send2trash(path)
+        except ImportError:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                return f"{relative}: {exc}"
+        except OSError as exc:
+            return f"{relative}: {exc}"
+        except Exception as exc:
+            return f"{relative}: {exc}"
+        return None
+
+    def set_active_take(self, entry: TimestampEntry, index: int) -> dict:
+        """Make ``takes[index]`` the entry's active audio take."""
+        take = self._take_at(entry, index)
+        path = os.path.join(self.output_dir, str(take["file"]))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        entry.audio_file = str(take["file"])
+        duration = take.get("duration_seconds")
+        entry.duration_seconds = float(duration) if duration is not None else None
+        self.save()
+        return take
+
+    def remove_take(self, entry: TimestampEntry, index: int) -> dict:
+        """Delete ``takes[index]`` from disk and from the entry.
+
+        Removing the active take promotes the newest remaining one. Removing
+        the last take clears the audio pointers and returns the entry to
+        ``pending`` so it can be recorded again like a fresh timestamp.
+        """
+        if entry.status == "recording":
+            raise ValueError("Cannot delete a take while it is recording")
+        take = self._take_at(entry, index)
+        was_active = take.get("file") == entry.audio_file
+        self._unlink_project_file(str(take["file"]))
+        entry.takes.remove(take)
+        if was_active:
+            if entry.takes:
+                newest = entry.takes[-1]
+                entry.audio_file = str(newest["file"])
+                duration = newest.get("duration_seconds")
+                entry.duration_seconds = (
+                    float(duration) if duration is not None else None
+                )
+            else:
+                entry.audio_file = None
+                entry.duration_seconds = None
+                entry.status = "pending"
+        self.save()
+        return take
 
     def update_entry(
         self,
@@ -628,45 +853,58 @@ class TimestampSession:
         return entry
 
     def remove_entry(self, entry_id: int) -> tuple[TimestampEntry, list[str]]:
-        """Remove an entry from the log and delete its media files.
+        """Remove an entry from the log and recycle its media files.
 
-        The entry's WAV note (``audio_file``) and screenshot JPEG
-        (``screenshot_file``) are unlinked from disk when they exist; the
-        linked OBS replay video (``replay_file``) is never touched. Cleanup
-        is best effort: a locked or undeletable file never blocks removing
-        the log entry — it is reported instead. Missing files are not
-        reported.
+        The entry's WAV notes (all takes) and screenshot JPEG are moved to
+        the Recycle Bin when they exist; the linked OBS replay video
+        (``replay_file``) is never touched. Files are recycled first — if
+        any file cannot be recycled (locked, permission error) the entry
+        remains and the caller receives the problems so the user can retry
+        after freeing the file. Missing files are not reported.
 
         Returns ``(entry, problems)`` where ``problems`` holds one
-        human-readable string per file left behind on disk.
+        human-readable string per file that could not be recycled. When
+        problems is non-empty the entry was NOT removed.
         """
         entry = self.get(entry_id)
         if entry is None:
             raise KeyError(entry_id)
         if entry.status == "recording":
             raise ValueError("Cannot delete a timestamp while it is recording")
-        base = os.path.normcase(os.path.abspath(self.output_dir)) + os.sep
+        relatives = [entry.audio_file, entry.screenshot_file]
+        relatives.extend(str(take.get("file")) for take in entry.takes)
         problems: list[str] = []
-        for relative in (entry.audio_file, entry.screenshot_file):
-            if not relative:
-                continue
-            path = os.path.abspath(os.path.join(self.output_dir, relative))
-            if not os.path.normcase(path).startswith(base):
-                # Hand-edited session.json must not make us unlink arbitrary
-                # files outside the project folder.
-                problems.append(
-                    f"{relative}: outside the project folder, left untouched"
-                )
-                continue
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                problems.append(f"{relative}: {exc}")
+        blocking: list[str] = []
+        for relative in dict.fromkeys(r for r in relatives if r):
+            problem = self._recycle_project_file(relative)
+            if problem:
+                problems.append(problem)
+                if "outside the project folder" not in problem:
+                    blocking.append(problem)
+        if blocking:
+            return entry, problems
         self.entries.remove(entry)
         self.save()
         return entry, problems
+
+    def update_entry_time(self, entry_id: int, elapsed_seconds: float) -> TimestampEntry:
+        """Set an entry's timestamp offset, then persist.
+
+        Validates the new offset is non-negative; recording entries remain
+        locked. The entry stays in its current segment — only the displayed
+        time changes.
+        """
+        entry = self.get(entry_id)
+        if entry is None:
+            raise KeyError(entry_id)
+        if entry.status == "recording":
+            raise ValueError("Cannot edit a timestamp while it is recording")
+        seconds = float(elapsed_seconds)
+        if seconds < 0:
+            raise ValueError("Timestamp time cannot be negative")
+        entry.elapsed_seconds = seconds
+        self.save()
+        return entry
 
     def count_entries_with_tag(self, name: str) -> int:
         """Number of entries currently carrying this tag (case-insensitive)."""
@@ -733,6 +971,14 @@ class TimestampSession:
 
     def save(self) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
+        # Keep one-generation backup so "restore from backup" is real.
+        if os.path.isfile(self.metadata_path):
+            backup_path = os.path.join(self.output_dir, "session.backup.json")
+            try:
+                import shutil
+                shutil.copy2(self.metadata_path, backup_path)
+            except OSError:
+                pass
         payload = {
             "version": SESSION_FORMAT_VERSION,
             "project_name": self.project_name,
@@ -805,6 +1051,19 @@ class TimestampSession:
             # Obsidian wikilink embed: bare filename resolves vault-wide,
             # so no folder path is needed.
             lines.append(f"  - ![[{os.path.basename(entry.screenshot_file)}]]")
+        if len(entry.takes) > 1:
+            # Alternate retakes under the headline link; the active take is
+            # already linked there, so only the others are listed.
+            for take_number, take in enumerate(entry.takes, start=1):
+                relative = str(take.get("file") or "")
+                if not relative or relative == entry.audio_file:
+                    continue
+                duration = take.get("duration_seconds")
+                length = f" ({duration:.1f}s)" if duration else ""
+                lines.append(
+                    f"  - Take {take_number}: [{os.path.basename(relative)}]"
+                    f"({relative}){length}"
+                )
         if entry.error:
             lines.append(f"  - Error: {entry.error}")
         if entry.transcript:
@@ -834,6 +1093,14 @@ class TimestampSession:
             wrote_any = True
             lines.append(f"### {header}")
             lines.append("")
+            if recording is not None and recording.path:
+                # Same Footage line shape replay entries use; the video lives
+                # outside the project folder, so link it by file:/// URI.
+                uri = replay_file_uri(recording.path)
+                if uri:
+                    footage_name = os.path.basename(str(recording.path))
+                    lines.append(f"- Footage: [{footage_name}]({uri})")
+                    lines.append("")
             for entry in entries:
                 lines.extend(self._markdown_entry_lines(entry))
             duration = (
@@ -888,9 +1155,11 @@ class TimestampSession:
         except (KeyError, TypeError, ValueError):
             self.entries = []
 
-        # A process cannot resume a live microphone stream or OBS timer. The
-        # next OBS recording start creates a fresh segment for this project.
+        # A process cannot resume a live microphone stream or OBS timer.
+        # Closing while paused counts as stopped, so pause never survives a restart.
         self.timer_running = False
+        self.timer_paused = False
+        self._pause_started_at = None
         self.current_recording_number = None
         for entry in self.entries:
             if entry.status == "recording":
@@ -904,21 +1173,119 @@ class AudioError(RuntimeError):
     """Raised when microphone capture cannot be started or completed."""
 
 
+def rms_int16(chunk: bytes) -> float:
+    """Root-mean-square amplitude of signed 16-bit little-endian PCM data.
+
+    Pure helper (no sounddevice dependency) so silence-detection math can be
+    unit-tested with synthetic buffers.
+    """
+    sample_count = len(chunk) // 2
+    if not sample_count:
+        return 0.0
+    samples = struct.unpack(f"<{sample_count}h", chunk[: sample_count * 2])
+    sum_squares = sum(sample * sample for sample in samples)
+    return (sum_squares / sample_count) ** 0.5
+
+
+def normalize_level(rms: float, clamp: float = MIC_LEVEL_CLAMP_RMS) -> float:
+    """Map int16 RMS counts onto a 0..1 meter scale."""
+    if rms <= 0:
+        return 0.0
+    return min(1.0, float(rms) / float(clamp))
+
+
+class SilenceMonitor:
+    """Detect a microphone that never picked up any input while recording.
+
+    The GUI feeds every captured chunk's RMS into :meth:`update` and polls
+    :meth:`should_stop`; when no level ever rises above ``threshold`` for
+    ``timeout`` seconds, the capture is auto-stopped and discarded so the
+    user can retry instead of saving a silent file. Once any activity is
+    detected the monitor is disarmed for the rest of the take: pauses in
+    speech must never cause recorded audio to be thrown away.
+    """
+
+    def __init__(
+        self,
+        threshold: float = MIC_SILENCE_THRESHOLD_DEFAULT,
+        timeout: float = MIC_SILENCE_TIMEOUT_DEFAULT,
+        min_elapsed: float = 1.0,
+    ):
+        self.threshold = max(0.0, float(threshold))
+        self.timeout = max(0.0, float(timeout))
+        # Grace period after start before a stop may fire, so stream-startup
+        # hiccups cannot trigger an instant discard.
+        self.min_elapsed = max(0.0, float(min_elapsed))
+        self.reset()
+
+    @property
+    def voice_detected(self) -> bool:
+        """Whether any chunk has reached the threshold since the last reset."""
+        return self._voice_seen
+
+    def reset(self, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        self.started_at = now
+        self.last_voice_at = now
+        self._voice_seen = False
+
+    def update(self, rms: float, now: Optional[float] = None) -> None:
+        """Feed one chunk's RMS; any detection disarms the auto-stop."""
+        if rms >= self.threshold:
+            self._voice_seen = True
+            self.last_voice_at = time.monotonic() if now is None else now
+
+    def silent_seconds(self, now: Optional[float] = None) -> float:
+        now = time.monotonic() if now is None else now
+        return max(0.0, now - self.last_voice_at)
+
+    def should_stop(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        # Any detected activity makes the take immune to auto-discard; only a
+        # capture that stayed completely silent from start to finish may fire.
+        if self._voice_seen:
+            return False
+        if now - self.started_at < self.min_elapsed:
+            return False
+        return self.silent_seconds(now) >= self.timeout
+
+
 class AudioRecorder:
     """Capture one microphone stream and write signed 16-bit mono WAV audio."""
 
-    def __init__(self, sample_rate: int = AUDIO_SAMPLE_RATE):
+    def __init__(
+        self,
+        sample_rate: int = AUDIO_SAMPLE_RATE,
+        silence_threshold: float = MIC_SILENCE_THRESHOLD_DEFAULT,
+        silence_timeout: float = MIC_SILENCE_TIMEOUT_DEFAULT,
+    ):
         self.sample_rate = sample_rate
+        self.silence_threshold = max(0.0, float(silence_threshold))
+        self.silence_timeout = max(0.0, float(silence_timeout))
         self._stream = None
         self._chunks: list[bytes] = []
         self._lock = threading.Lock()
         self._active = False
         self._path: Optional[str] = None
         self._started_at = 0.0
+        self._latest_rms = 0.0
+        self._monitor = SilenceMonitor(self.silence_threshold, self.silence_timeout)
 
     @property
     def active(self) -> bool:
         return self._active
+
+    @property
+    def level(self) -> float:
+        """Latest input level normalized to 0..1 for meter widgets."""
+        with self._lock:
+            rms = self._latest_rms
+        return normalize_level(rms)
+
+    @property
+    def monitor(self) -> SilenceMonitor:
+        """Silence watchdog fed by the capture callback."""
+        return self._monitor
 
     @staticmethod
     def _sounddevice():
@@ -965,9 +1332,15 @@ class AudioRecorder:
         sd = self._sounddevice()
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         chunks: list[bytes] = []
+        monitor = SilenceMonitor(self.silence_threshold, self.silence_timeout)
 
         def callback(indata, _frames, _time_info, _status):
-            chunks.append(bytes(indata))
+            chunk = bytes(indata)
+            chunks.append(chunk)
+            level = rms_int16(chunk)
+            monitor.update(level)
+            with self._lock:
+                self._latest_rms = level
 
         try:
             # Check the device before opening the callback stream so common
@@ -999,6 +1372,8 @@ class AudioRecorder:
             self._chunks = chunks
             self._path = output_path
             self._started_at = time.monotonic()
+            self._latest_rms = 0.0
+            self._monitor = monitor
             self._active = True
 
     def stop(self) -> tuple[str, float]:
@@ -1042,6 +1417,27 @@ class AudioRecorder:
                 os.remove(path)
         except Exception:
             pass
+
+    def discard(self) -> None:
+        """Stop capture and throw away everything recorded, writing nothing.
+
+        Used by the silence watchdog: a recording that never picked up any
+        audible input is not worth keeping, so no WAV file is created.
+        """
+        with self._lock:
+            if not self._active or self._stream is None:
+                raise AudioError("No microphone recording is active")
+            stream = self._stream
+            self._active = False
+            self._stream = None
+            self._path = None
+            self._chunks = []
+            self._latest_rms = 0.0
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as exc:
+            raise AudioError(f"Could not stop microphone: {exc}") from exc
 
 
 class PlaybackController:

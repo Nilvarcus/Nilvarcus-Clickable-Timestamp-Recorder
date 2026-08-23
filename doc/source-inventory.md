@@ -4,11 +4,11 @@
 
 | File | Responsibility |
 |---|---|
-| `timestamp_gui.py` | Main GUI, project controls, OBS timer synchronization, replay-save logging, configurable hotkey, tag-library manager, timestamp list, and playback actions. |
-| `timestamp_audio.py` | Timestamp/replay-entry model, recording segments, tag-library helpers and propagation, project persistence, Markdown generation, microphone recording, and playback. |
+| `timestamp_gui.py` | Main GUI, project controls, OBS timer synchronization (finalize-on-transition watchdog handling), replay-save logging, configurable hotkey, tag-library manager, timestamp list with per-entry take chips, edit-dialog audio-take management/re-record UI, footer mic level meter with silence auto-stop, and playback actions. |
+| `timestamp_audio.py` | Timestamp/replay-entry model, recording segments, per-entry audio takes (registration/activation/removal), silence-detection helpers (`rms_int16`, `SilenceMonitor`), tag-library helpers and propagation, project persistence, Markdown generation (incl. alternate takes), microphone recording with level tracking and discard, and playback. |
 | `timestamp_obs.py` | OBS WebSocket connection with auto-reconnect watchdog, recording status, recording file path events, replay-buffer save events, and callbacks. |
 | `timestamp_screenshot.py` | Main-monitor JPEG capture (mss + Pillow) for per-timestamp context shots; pure size helper and lazily imported dependencies. |
-| `test_timestamp_audio.py` | Unit tests for core timestamp/audio-session behavior plus screenshot path/Markdown/capture tests. |
+| `test_timestamp_audio.py` | Unit tests for core timestamp/audio-session behavior, per-entry takes (registration, activation, removal, persistence, Markdown), legacy `session.json` compatibility, mic-level/silence helpers, plus screenshot path/Markdown/capture tests. |
 | `test_timestamp_obs.py` | Dependency-light unit tests for the OBS manager: socket-liveness probe across obsws-python client layouts (fail-open on unknown shapes) and recording start/stop transition guards. |
 
 ## Configuration and build

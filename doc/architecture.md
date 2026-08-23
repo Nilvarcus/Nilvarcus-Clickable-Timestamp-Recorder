@@ -37,6 +37,8 @@ Wraps `obsws-python` request and event clients. It exposes connection state and 
 
 An optional watchdog (`enable_auto_reconnect`) runs as a daemon thread: while enabled and not user-suppressed it attempts a connection immediately and then roughly every 5 seconds, firing a `"waiting"` status instead of error spam on failed retries. While connected it passively inspects the event client's underlying socket (defensive attribute access; no extra WebSocket requests, avoiding concurrent-request races) so an OBS exit is detected, torn down internally, and retried. Connection attempts carry an epoch counter so an attempt in flight during a disconnect goes stale silently. Explicit `disconnect()` sets a suppression flag paused until the next explicit `connect()`; internal teardown never touches it.
 
+On the GUI side the repeated `"waiting"` status is *not* a session-ending signal: `TimestampApp._obs_was_up` records whether a connection was actually up, and `_stop_obs_timer()` runs only when that flag flips — a real connected→dropped transition (or an explicit disconnect while up). While OBS is merely unreachable, retry passes leave any manual ▶ timer and active microphone recording untouched, so voiceover work without OBS runs indefinitely.
+
 ### `timestamp_screenshot.py`
 
 Captures the context snapshot saved next to each new timestamp. `capture_to_path` lazily imports mss and Pillow (so tests run without them), grabs OS primary monitor 1 in physical pixels, converts BGRA→RGB, scales to at most 720 px height without upscaling, and writes JPEG quality 100. `compute_target_size` is a pure function so the scaling rule is unit-testable. Failures raise `ScreenshotError`; callers keep the timestamp valid.
@@ -56,10 +58,11 @@ OBS output-start event or initial record-status query
     RecordStateChanged.outputPath when OBS reported it)
   → root.after(0, TimestampApp._start_obs_timer)
   → TimestampSession.start_timer(recording_name)   # opens a numbered segment
+  → TimestampSession.set_recording_path(number, path)   # when OBS reported one
   → timestamp button enabled, segment header appears in the list
 ```
 
-The segment name is derived from the OBS recording file name (basename without extension). When the app connects while OBS is already recording, no file path is available yet; the segment starts unnamed and is renamed via `TimestampSession.name_recording` when the stop event reveals the final path.
+The segment name is derived from the OBS recording file name (basename without extension). When the app connects while OBS is already recording, no file path is available yet; the segment starts unnamed and is renamed via `TimestampSession.name_recording` when the stop event reveals the final path. The full video path is kept on the segment (`RecordingInfo.path`) via `set_recording_path` — the start event fills it immediately, and the stop event confirms or corrects it.
 
 ### Manual timer (OBS-free sessions)
 
@@ -72,7 +75,7 @@ The segment name is derived from the OBS recording file name (basename without e
   → TimestampSession.stop_timer()           # segment closed, creation locked
 ```
 
-Both entry points share the model methods, so segments, per-segment indices, locking, and Markdown sections behave identically regardless of who started the timer. If a manual timer is already running when OBS starts, `start_timer` no-ops and the live segment continues; the eventual OBS stop still backfills its file name before locking.
+Both entry points share the model methods, so segments, per-segment indices, locking, and Markdown sections behave identically regardless of who started the timer. If a manual timer is already running when OBS starts, `start_timer` no-ops and the live segment continues; the eventual OBS stop still backfills its file name and video path before locking.
 
 Row clicks are never gated on the timer: pending/error rows record, recording rows stop, completed rows play — only *creating* timestamps requires a running timer.
 
@@ -103,6 +106,8 @@ New timestamp created (button/hotkey/manual)
 Capture failure only shows an amber status message; the timestamp stays valid and its entry simply has no image line.
 
 Each timestamp row carries a 📷 button (`_open_screenshot`) that opens `entry.screenshot_file` (stored relative to the project folder) with the OS default image viewer, mirroring a replay row's 🎬 button. The button renders disabled until the asynchronous capture attaches the JPEG, so in-flight, failed, and pre-screenshot entries stay greyed out; a click on a missing file reports an error in the status bar. Replay rows capture no screenshot and keep no 📷 button.
+
+Each recording section header carries a 📼 button (`_open_recording_video`) that opens that segment's main OBS recording video with the OS default player, sharing the same open-with-default-app helper as 🎬 and 📷 (`_open_with_default_app`). The button renders disabled while the segment has no stored video path: segments recorded by older app versions, events without a reported output path, and in-app ▶/■ timer-only segments never get one. A missing file reports an error in the status bar; nothing is ever deleted.
 
 ### OBS stop
 
@@ -135,8 +140,8 @@ Without a selected project the save is announced but not logged. Replay rows reu
 
 Each project folder contains:
 
-- `<Project Name>.md`: readable log with one section per recording segment, relative links to completed WAV files, and an embedded screenshot line under each captured timestamp (an Obsidian wikilink embed using the bare filename: `![[R##-###_HH-MM-SS.jpg]]`).
-- `session.json`: project name, timer metadata, recording segments, timestamp states, file paths, durations, and relative screenshot filenames.
+- `<Project Name>.md`: readable log with one section per recording segment, a `Footage:` link under each segment header whose video path is known, relative links to completed WAV files, and an embedded screenshot line under each captured timestamp (an Obsidian wikilink embed using the bare filename: `![[R##-###_HH-MM-SS.jpg]]`).
+- `session.json`: project name, timer metadata, recording segments (including their OBS video paths), timestamp states, file paths, durations, and relative screenshot filenames.
 - `R##-###_HH-MM-SS.wav`: microphone recordings, named after their segment and per-segment index.
 - `Screenshots/R##-###_HH-MM-SS.jpg`: per-timestamp main-monitor snapshots (720p-height JPEG).
 

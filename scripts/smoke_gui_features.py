@@ -11,6 +11,9 @@ Steps exercised:
   3. Timestamp edit dialog chip refresh while the manager is open.
   4. Watchdog "Waiting for OBS…" status with OBS stopped, and suppression
      after an explicit disconnect.
+  5. Watchdog finalize-on-transition regression: repeated "waiting" passes
+     with OBS off never kill a manual timer/mic recording; only a real
+     connected→dropped transition does.
 """
 
 from __future__ import annotations
@@ -215,6 +218,70 @@ def main() -> int:
             not app.obs_manager._user_suppressed,
         )
         pump(root, 1.0)
+
+        # ── 6. Watchdog finalize-on-transition regression ────────────────
+        # Drive the GUI status handler directly so no real OBS state can
+        # interfere; force _obs_was_up explicitly for determinism.
+        app.session.start_timer()
+        app._obs_was_up = False
+        for _ in range(3):  # repeated retry-cycle passes
+            app._on_obs_status_change("waiting")
+        pump(root, 0.3)
+        check(
+            "repeated waiting passes with OBS never up keep the timer running",
+            app.session.timer_running,
+        )
+
+        class StubRecorder:
+            """Mimics AudioRecorder.stop()'s absolute-path contract."""
+
+            active = True
+            level = 0.0
+            monitor = None
+
+            def __init__(self, output_dir):
+                self.output_dir = output_dir
+                self.stopped = False
+
+            def stop(self):
+                self.active = False
+                self.stopped = True
+                return (os.path.join(self.output_dir, "stub.wav"), 1.0)
+
+            def discard(self):
+                self.active = False
+
+            def cancel(self):
+                self.active = False
+
+        stub = StubRecorder(app.session.output_dir)
+        real_recorder = app.recorder
+        app.recorder = stub
+        try:
+            mic_entry = app.session.create_timestamp(1)
+            app.recording_entry_id = mic_entry.id
+            app.session.mark_recording(mic_entry)
+            app._on_obs_status_change("waiting")
+            pump(root, 0.2)
+            check(
+                "waiting pass with OBS never up keeps the mic recording alive",
+                stub.active and app.session.get(mic_entry.id).status == "recording",
+            )
+
+            app.session.start_timer()  # re-arm in case anything stopped it
+            app._obs_was_up = True
+            app._on_obs_status_change("waiting")
+            pump(root, 0.2)
+            check(
+                "connected→dropped transition stops timer and saves the note",
+                not app.session.timer_running
+                and stub.stopped
+                and app.session.get(mic_entry.id).status == "completed",
+            )
+        finally:
+            app.recorder = real_recorder
+            app.recording_entry_id = None
+            app._stop_mic_meter()
 
         editor.destroy()
         app.on_closing()

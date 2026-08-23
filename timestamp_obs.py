@@ -274,7 +274,11 @@ class OBSManager:
                 self._connected = False
                 self._recording_active = False
                 self._replay_buffer_active = None
-            if source == "manual":
+            if self._is_auth_failure(exc):
+                # Wrong password / auth failures must surface even from the
+                # watchdog — "Waiting for OBS…" hides the real problem.
+                self._fire(self._on_status_change, f"auth_error:{exc}")
+            elif source == "manual":
                 # A user-initiated attempt deserves the visible error.
                 self._fire(self._on_status_change, f"error:{exc}")
             else:
@@ -332,6 +336,12 @@ class OBSManager:
         else:
             print("[OBS] ReplayBufferSaved arrived without a resolvable path")
             self._fire(self._on_replay_saved, None)
+
+    @staticmethod
+    def _is_auth_failure(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = ("auth", "password", "401", "unauthorized", "authentication")
+        return any(marker in text for marker in markers)
 
     @staticmethod
     def _fire(callback, *args) -> None:
