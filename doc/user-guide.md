@@ -3,7 +3,7 @@
 ## Install
 
 ```bash
-python -m pip install customtkinter pynput obsws-python sounddevice mss pillow
+python -m pip install customtkinter pynput obsws-python sounddevice mss pillow send2trash
 ```
 
 OBS Studio and a microphone are required for normal use.
@@ -29,7 +29,7 @@ Or launch the latest packaged build at `dist/timestamp_gui_lite.exe`.
 
 The timer starts automatically when OBS starts recording. The **New timestamp** button and configured hotkey become available. To work without OBS, click **▶ Start timer** instead — see [Timer without OBS](#timer-without-obs).
 
-Clicking the **project name field** opens a popup listing your five most recent projects; pick one to reopen it instantly (its output folder and session load together). Typing a fresh name works as usual — any keypress dismisses the popup.
+Clicking the **project name field** opens a popup listing your five most recent projects; pick one to reopen it instantly (its output folder and session load together). Each row shows the project's activity — `12 timestamps · 3 recordings`, read live from its log — instead of the folder path, plus a 🗑 delete button: after a confirmation the project's folder moves to the Recycle Bin and the entry disappears from the list. The project you currently have open can't be deleted until you switch to another one, a failed recycle keeps the entry, and an entry whose folder is already gone shows `(folder missing)` and removes itself from the list without touching anything. Typing a fresh name works as usual — any keypress dismisses the popup.
 
 ## Timer without OBS
 

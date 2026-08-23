@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+- Hardened the recent-projects picker: rows now show each project's activity — `N timestamps · M recordings`, read from its `session.json` — instead of a truncated folder path, and every row gained a 🗑 delete button that moves the project's folder to the Recycle Bin (via the new `send2trash` dependency) after a confirmation and only then removes the list entry. The folder is recycled first, so a locked or failed delete never leaves a stale entry pointing at live files; entries whose folder already vanished show a dim `(folder missing)` marker and degrade to removing just the list entry; the currently open project refuses deletion until another one is selected; and the popup rebuilds in place after each delete so several projects can be cleaned out in one pass.
+- Screenshot embeds in each project's Markdown log now use Obsidian wikilink syntax with just the filename (`![[R02-005_00-00-19.jpg]]`) instead of standard image syntax with a folder path (`![Screenshot](Screenshots/...)`), so they render directly inside Obsidian vaults without any folder prefix. Storage, capture, and `session.json` are unchanged; existing projects regenerate into the new format on their next save.
+
 ## MVP — Clickable Timestamp Recorder
 
 - Added a recording-stop marker: when a recording ends (OBS stop or the in-app ■ toggle), a dim `■ Recording stopped — HH:MM:SS` row appears at the bottom of that recording segment in the timestamp list, and each finished segment's Markdown section gains an italic `_Recording stopped — HH:MM:SS_` line. The duration comes from the segment's existing `started_at`/`ended_at` timestamps (no session-format change), persists across restarts for past segments, and live segments show no footer while running; a newly appearing footer participates in smart-follow scrolling like any other list change.

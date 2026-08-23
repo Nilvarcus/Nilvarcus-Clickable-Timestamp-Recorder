@@ -17,7 +17,7 @@ session.json (v5) stores the transcript and regenerates <Project>.md with a
 dedicated block:
 
   - 001 [00:00:06](R01-001_00-00-06.wav) — completed, 9.3s
-    - ![Screenshot](Screenshots\\R01-001_00-00-06.jpg)
+    - ![[R01-001_00-00-06.jpg]]
     - Transcript:
       ```
       hello world

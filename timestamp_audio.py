@@ -237,6 +237,53 @@ def update_recent_projects(
     return updated[:limit]
 
 
+def remove_recent_project(recents, project_name: str, output_folder: str) -> list[dict]:
+    """Return recents without the entry matching this name + folder.
+
+    Matching mirrors update_recent_projects: names case-insensitively and
+    folders as normalized absolute paths. Unknown entries leave the list
+    unchanged; malformed entries are still sanitized away.
+    """
+    cleaned = sanitize_recent_projects(recents)
+    name = str(project_name).strip()
+    folder = str(output_folder).strip()
+    if not name or not folder:
+        return cleaned
+    key = (name.casefold(), os.path.normcase(os.path.abspath(os.path.expanduser(folder))))
+    return [
+        entry
+        for entry in cleaned
+        if (entry["name"].casefold(), os.path.normcase(entry["output_folder"])) != key
+    ]
+
+
+def read_project_stats(output_folder) -> dict:
+    """Count a stored project's activity from its session.json.
+
+    Returns {"timestamps": int, "recordings": int} where timestamps counts
+    clickable entries and recordings counts OBS/timer segments. Missing,
+    corrupt, or malformed data yields zeros so the recent-projects popup can
+    always render; the file is only read, never written.
+    """
+    stats = {"timestamps": 0, "recordings": 0}
+    folder = str(output_folder or "").strip()
+    if not folder:
+        return stats
+    metadata_path = os.path.join(os.path.expanduser(folder), SESSION_FILENAME)
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return stats
+    if not isinstance(payload, dict):
+        return stats
+    for key, target in (("entries", "timestamps"), ("recordings", "recordings")):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            stats[target] = len(raw)
+    return stats
+
+
 @dataclass
 class RecordingInfo:
     """One OBS recording segment inside a project.
@@ -755,7 +802,9 @@ class TimestampSession:
                 footage_name = os.path.basename(str(entry.replay_file))
                 lines.append(f"  - Footage: [{footage_name}]({uri})")
         if entry.screenshot_file:
-            lines.append(f"  - ![Screenshot]({entry.screenshot_file})")
+            # Obsidian wikilink embed: bare filename resolves vault-wide,
+            # so no folder path is needed.
+            lines.append(f"  - ![[{os.path.basename(entry.screenshot_file)}]]")
         if entry.error:
             lines.append(f"  - Error: {entry.error}")
         if entry.transcript:

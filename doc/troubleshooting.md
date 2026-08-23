@@ -25,6 +25,8 @@ Creating timestamps needs a running timer: an active OBS recording **or** the in
 - The popup only lists projects set through **Set project** (or loaded from the popup) since the feature was added; it fills up as you work.
 - Click directly on the project-name field; typing any character closes it so new names can be entered normally.
 - Entries live in `keybinds.json` under `recent_projects`; malformed entries are ignored, and the list keeps at most five projects.
+- Entries whose folder no longer exists render a dim `(folder missing)` marker instead of counts; selecting one recreates the folder — same as setting the project fresh.
+- Deleting a project from the popup needs the `send2trash` package (`python -m pip install send2trash`) when its folder exists; if recycling fails (e.g., a file inside is open in another program), an error dialog appears and the project stays listed.
 - Selecting a project whose folder was deleted recreates the folder — same as setting the project fresh.
 
 ## Timer questions

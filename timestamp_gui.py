@@ -29,6 +29,8 @@ from timestamp_audio import (
     format_elapsed_display,
     normalize_tag_name,
     parse_time_input,
+    read_project_stats,
+    remove_recent_project,
     replay_display_name,
     sanitize_project_name,
     sanitize_recent_projects,
@@ -132,6 +134,10 @@ FOLDER_LABEL_MAX_CHARS = 40
 # plus a "+N" overflow chip; long labels get middle-elided.
 ROW_TAG_CHIPS = 3
 ROW_LABEL_MAX_CHARS = 34
+
+# Recent-projects rows show "<name> · N timestamps · M recordings"; long
+# names get middle-elided so the counts stay visible.
+RECENT_ROW_NAME_MAX_CHARS = 36
 
 # A hotkey press only re-fires after this many seconds. This swallows OS
 # auto-repeat, and — more importantly — means a missed release event can never
@@ -745,6 +751,19 @@ class TimestampApp:
         popup = ctk.CTkToplevel(self.root)
         popup.wm_overrideredirect(True)
         popup.configure(fg_color=Theme.BG_SURFACE, corner_radius=10)
+        self._render_recent_rows(popup)
+        self._place_recent_popup(popup)
+
+        self._recent_popup = popup
+        # Any click elsewhere in the main window dismisses the popup.
+        self._popup_bind_id = self.root.bind(
+            "<Button-1>", self._on_root_click_during_popup, add="+"
+        )
+
+    def _render_recent_rows(self, popup: ctk.CTkToplevel) -> None:
+        """(Re)draw the popup header plus one stats row per recent project."""
+        for child in popup.winfo_children():
+            child.destroy()
         ctk.CTkLabel(
             popup,
             text="Recent projects",
@@ -755,18 +774,55 @@ class TimestampApp:
         for entry in self.recent_projects:
             name = str(entry.get("name", ""))
             folder = str(entry.get("output_folder", ""))
+            text, color = self._recent_row_text(entry)
+            row = ctk.CTkFrame(popup, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=2)
+            row.grid_columnconfigure(0, weight=1)
             ctk.CTkButton(
-                popup,
-                text=f"{name}   ·   {folder}",
+                row,
+                text=text,
                 anchor="w",
                 height=34,
                 font=Theme.FONT_SMALL,
                 fg_color=Theme.BG_ENTRY,
                 hover_color=Theme.BTN_SURFACE_HOVER,
-                text_color=Theme.TEXT_BRIGHT,
+                text_color=color,
                 command=lambda n=name, f=folder: self._load_recent_project(n, f),
-            ).pack(fill="x", padx=8, pady=2)
+            ).grid(row=0, column=0, sticky="ew")
+            ctk.CTkButton(
+                row,
+                text="\U0001F5D1",
+                width=34,
+                height=34,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BG_ENTRY,
+                hover_color=Theme.CRIMSON_HOVER,
+                text_color=Theme.TEXT_DIM,
+                command=lambda e=dict(entry): self._delete_recent_project(e),
+            ).grid(row=0, column=1, padx=(4, 0))
 
+    @staticmethod
+    def _recent_row_text(entry: dict) -> tuple[str, str]:
+        """Return (row text, text color) for one recent-project row.
+
+        Rows show activity read from the project's session.json instead of
+        the folder path; stale entries whose folder vanished render a dim
+        missing marker so deletes degrade gracefully.
+        """
+        name = elide_middle(str(entry.get("name", "")), RECENT_ROW_NAME_MAX_CHARS)
+        folder = str(entry.get("output_folder", ""))
+        if not folder or not os.path.isdir(folder):
+            return f"{name}   ·   (folder missing)", Theme.TEXT_DIM
+        stats = read_project_stats(folder)
+        timestamps = stats["timestamps"]
+        recordings = stats["recordings"]
+        ts_word = "timestamp" if timestamps == 1 else "timestamps"
+        rec_word = "recording" if recordings == 1 else "recordings"
+        text = f"{name}   ·   {timestamps} {ts_word} · {recordings} {rec_word}"
+        return text, Theme.TEXT_BRIGHT
+
+    def _place_recent_popup(self, popup: ctk.CTkToplevel) -> None:
+        """Size the popup to its row count and keep it near the entry field."""
         width = max(430, self.project_name_entry.winfo_width())
         row_count = len(self.recent_projects)
         height = 48 + row_count * 38 + 10
@@ -781,12 +837,6 @@ class TimestampApp:
         if y + height > bottom_limit - 8:
             y = max(self.root.winfo_rooty() + 8, entry_y - height - 6)
         popup.geometry(f"{width}x{height}+{x}+{y}")
-
-        self._recent_popup = popup
-        # Any click elsewhere in the main window dismisses the popup.
-        self._popup_bind_id = self.root.bind(
-            "<Button-1>", self._on_root_click_during_popup, add="+"
-        )
 
     def _close_recent_popup(self) -> None:
         """Dismiss the recent-projects popup if it is showing."""
@@ -831,6 +881,83 @@ class TimestampApp:
         )
         self.project_name_var.set(name)
         self._set_project()
+
+    def _delete_recent_project(self, entry: dict) -> None:
+        """Forget one recent project, recycling its folder behind a confirm.
+
+        The folder is moved to the Recycle Bin first; only a successful move
+        removes the entry from keybinds.json, so a locked or undeletable
+        folder can never leave a phantom entry pointing at live files. A
+        missing folder degrades to removing just the stale list entry.
+        """
+        name = str(entry.get("name", ""))
+        folder = str(entry.get("output_folder", ""))
+        if self.session is not None and self._same_path(folder, self.output_folder):
+            messagebox.showinfo(
+                "Project in use",
+                f'"{name}" is currently open.\nSelect another project before deleting it.',
+                parent=self.root,
+            )
+            return
+        if folder and os.path.isdir(folder):
+            if not messagebox.askyesno(
+                "Delete project",
+                f'Delete "{name}"?\n\nIts folder will be moved to the Recycle Bin:\n{folder}',
+                parent=self.root,
+            ):
+                return
+            try:
+                from send2trash import send2trash
+            except ImportError:
+                messagebox.showerror(
+                    "send2trash missing",
+                    "Moving folders to the Recycle Bin needs the send2trash package.\n\n"
+                    "Install it with:\npython -m pip install send2trash",
+                    parent=self.root,
+                )
+                return
+            try:
+                send2trash(folder)
+            except Exception as exc:  # locked files, permission errors, …
+                messagebox.showerror(
+                    "Delete failed",
+                    f'Could not recycle "{folder}":\n{exc}\n\nThe project stays in recent projects.',
+                    parent=self.root,
+                )
+                return
+            status_note = "Folder moved to Recycle Bin."
+        else:
+            if not messagebox.askyesno(
+                "Remove project",
+                f'Remove "{name}" from recent projects?\n\n'
+                "Its folder was not found (already deleted or moved), so only this list entry is removed.",
+                parent=self.root,
+            ):
+                return
+            status_note = "Folder was already gone; removed the stale entry only."
+        self.recent_projects = remove_recent_project(self.recent_projects, name, folder)
+        self._save_config()
+        self._set_status(f'Deleted "{name}". {status_note}', Theme.CRIMSON)
+        self._refresh_recent_popup()
+
+    def _refresh_recent_popup(self) -> None:
+        """Redraw popup rows after a delete; close it when none remain."""
+        popup = self._recent_popup
+        if popup is None or not popup.winfo_exists():
+            return
+        if not self.recent_projects:
+            self._close_recent_popup()
+            return
+        self._render_recent_rows(popup)
+        self._place_recent_popup(popup)
+
+    @staticmethod
+    def _same_path(left: str, right: str) -> bool:
+        """Compare two paths Windows-style: absolute, separator- and case-blind."""
+        normalize = lambda path: os.path.normcase(
+            os.path.abspath(os.path.expanduser(str(path).strip()))
+        )
+        return normalize(left) == normalize(right)
 
     # ── Timestamp actions ─────────────────────────────────────────────────────
 

@@ -18,6 +18,7 @@ from timestamp_audio import (
     AudioRecorder,
     DEFAULT_TAG_COLOR,
     RecordingInfo,
+    SESSION_FILENAME,
     TAG_NAME_MAX_LENGTH,
     TimestampSession,
     clean_label,
@@ -26,6 +27,8 @@ from timestamp_audio import (
     format_elapsed_display,
     normalize_tag_name,
     parse_time_input,
+    read_project_stats,
+    remove_recent_project,
     replay_display_name,
     replay_file_uri,
     sanitize_project_name,
@@ -624,7 +627,7 @@ class ScreenshotSupportTests(unittest.TestCase):
             with open(os.path.join(folder, "My Project.md"), encoding="utf-8") as handle:
                 markdown = handle.read()
             self.assertIn("- 00:00:10 — pending", markdown)
-            self.assertIn(f"  - ![Screenshot]({shot_relative})", markdown)
+            self.assertIn("  - ![[001_00-00-10.jpg]]", markdown)
             # Entries without a screenshot render exactly as before.
             self.assertNotIn(os.path.join("Screenshots", "002_00-00-20.jpg"), markdown)
 
@@ -742,6 +745,65 @@ class RecentProjectTests(unittest.TestCase):
         self.assertEqual(update_recent_projects(stored, "Alpha", "   "), sanitize_recent_projects(stored))
 
 
+class RemoveRecentProjectTests(unittest.TestCase):
+    def test_matching_entry_is_removed_case_and_separator_blind(self):
+        stored = [
+            {"name": "Alpha", "output_folder": os.path.abspath("E:/a")},
+            {"name": "Beta", "output_folder": os.path.abspath("E:/b")},
+        ]
+        remaining = remove_recent_project(stored, "ALPHA", "e:/a/")
+        self.assertEqual([entry["name"] for entry in remaining], ["Beta"])
+
+    def test_unknown_entry_leaves_list_unchanged(self):
+        stored = [{"name": "Alpha", "output_folder": os.path.abspath("E:/a")}]
+        self.assertEqual(
+            remove_recent_project(stored, "Zeta", "E:/z"),
+            sanitize_recent_projects(stored),
+        )
+
+    def test_blank_arguments_are_a_noop(self):
+        stored = [{"name": "Alpha", "output_folder": os.path.abspath("E:/a")}]
+        self.assertEqual(remove_recent_project(stored, "", "E:/a"), sanitize_recent_projects(stored))
+        self.assertEqual(remove_recent_project(stored, "Alpha", "  "), sanitize_recent_projects(stored))
+
+
+class ReadProjectStatsTests(unittest.TestCase):
+    def _write_session(self, folder: str, payload) -> None:
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, SESSION_FILENAME)
+        with open(path, "w", encoding="utf-8") as handle:
+            if isinstance(payload, str):
+                handle.write(payload)
+            else:
+                json.dump(payload, handle)
+
+    def test_counts_entries_and_recordings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_session(
+                tmp,
+                {
+                    "entries": [{"id": 1}, {"id": 2}, {"id": 3}],
+                    "recordings": [{"number": 1}, {"number": 2}],
+                },
+            )
+            self.assertEqual(
+                read_project_stats(tmp), {"timestamps": 3, "recordings": 2}
+            )
+
+    def test_missing_folder_yields_zeros(self):
+        missing = os.path.join(tempfile.gettempdir(), "definitely-not-here-12345")
+        self.assertEqual(read_project_stats(missing), {"timestamps": 0, "recordings": 0})
+        self.assertEqual(read_project_stats(""), {"timestamps": 0, "recordings": 0})
+
+    def test_corrupt_or_malformed_data_yields_zeros(self):
+        for payload in ("{not json", [], 42, {}, {"entries": "three"}, {"recordings": {}}):
+            with tempfile.TemporaryDirectory() as tmp:
+                self._write_session(tmp, payload)
+                self.assertEqual(
+                    read_project_stats(tmp), {"timestamps": 0, "recordings": 0}
+                )
+
+
 class InputCleaningTests(unittest.TestCase):
     def test_parse_time_input_accepts_supported_formats(self):
         self.assertEqual(parse_time_input("90"), 90.0)
@@ -833,9 +895,9 @@ class TranscriptTests(unittest.TestCase):
             self.assertIn("    ```", md)
             self.assertIn("    First line", md)
             self.assertIn("    Second line", md)
-            # Screenshot still present above transcript fence
-            self.assertIn("![Screenshot]", md)
-            self.assertLess(md.index("![Screenshot]"), md.index("    ```"))
+            # Screenshot still present above transcript fence (Obsidian embed form)
+            self.assertIn("![[001_00-00-10.jpg]]", md)
+            self.assertLess(md.index("![[001_00-00-10.jpg]]"), md.index("    ```"))
 
     def test_markdown_no_transcript_no_block(self):
         with tempfile.TemporaryDirectory() as folder:

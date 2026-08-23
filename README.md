@@ -41,9 +41,9 @@ Completed recordings are linked from the Markdown file, which groups timestamps 
 ### [21-08][14-55-19]
 
 - 001 [00:12:34](R01-001_00-12-34.wav) — completed, 4.2s — "Good take" #kill #bug
-  - ![Screenshot](Screenshots/R01-001_00-12-34.jpg)
+  - ![[R01-001_00-12-34.jpg]]
 - 002 00:18:05 — pending
-  - ![Screenshot](Screenshots/R01-002_00-18-05.jpg)
+  - ![[R01-002_00-18-05.jpg]]
 ```
 
 Labels are optional short notes, and tags come from the preset list in `keybinds.json`.
@@ -57,7 +57,7 @@ Labels are optional short notes, and tags come from the preset list in `keybinds
 Install dependencies:
 
 ```bash
-python -m pip install customtkinter pynput obsws-python sounddevice mss pillow pyinstaller
+python -m pip install customtkinter pynput obsws-python sounddevice mss pillow send2trash pyinstaller
 ```
 
 Enable OBS WebSocket from **Tools → WebSocket Server Settings**. The default connection is `localhost:4455`; host, port, and password are stored in `keybinds.json`.
@@ -96,7 +96,7 @@ Creating new timestamps requires a running timer — either an active OBS record
 
 Replay saves are logged even while the timer is stopped (they attach to the most recent segment), but a project must be selected — without one the save is only announced in the status bar.
 
-Tip: click the **project name field** to reopen one of your five most recent projects instantly; typing a new name works as usual. If the app connects while OBS is already recording, it detects the active OBS recording and starts the timer after a project is selected; that segment's header falls back to `Recording N` until the recording stops and the real file name becomes known.
+Tip: click the **project name field** to reopen one of your five most recent projects instantly — each entry shows how many timestamps and recordings the project holds (read live from its log, not the folder path), and a 🗑 button deletes a project by moving its folder to the Recycle Bin after a confirmation. Typing a new name works as usual. If the app connects while OBS is already recording, it detects the active OBS recording and starts the timer after a project is selected; that segment's header falls back to `Recording N` until the recording stops and the real file name becomes known.
 
 ## Out of scope
 

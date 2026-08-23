@@ -46,9 +46,9 @@ Labels and tags appear as a suffix. The label is quoted; tags are rendered as `#
 ### [21-08][14-55-19]
 
 - 001 [00:12:34](R01-001_00-12-34.wav) — completed, 4.2s — "Good take" #kill #bug
-  - ![Screenshot](Screenshots/R01-001_00-12-34.jpg)
+  - ![[R01-001_00-12-34.jpg]]
 - 002 [00:18:05](R01-002_00-18-05.wav) — pending — "Check this later" #idea
-  - ![Screenshot](Screenshots/R01-002_00-18-05.jpg)
+  - ![[R01-002_00-18-05.jpg]]
 - 003 [00:21:40](R01-003_00-21-40.wav) — pending
 ```
 
@@ -77,7 +77,7 @@ Errors include an indented error detail below the timestamp (below the screensho
 
 ```markdown
 - 001 [00:12:34](R01-001_00-12-34.wav) — completed, 4.2s
-  - ![Screenshot](Screenshots/R01-001_00-12-34.jpg)
+  - ![[R01-001_00-12-34.jpg]]
     ```
     Hello, hello. Test, test, test.
     ```
@@ -123,3 +123,5 @@ Audio uses mono signed 16-bit PCM WAV at 44,100 Hz. New filenames contain the se
 ## Screenshot files
 
 Every new timestamp captures one JPEG snapshot of the main monitor for context, stored under `Screenshots/` inside the project folder. Filenames mirror the WAV scheme with a `.jpg` extension (`R02-001_00-12-34.jpg`, legacy `{id}_HH-MM-SS.jpg`) and are made unique with a numeric suffix instead of overwriting. Captures are scaled to at most 720 px height while preserving aspect ratio (smaller monitors keep their native size) and saved as JPEG quality 100 via mss + Pillow. Capture runs on a background thread after the timestamp exists; a failed capture leaves the entry without a screenshot and never blocks creation. Deleting a timestamp keeps its JPEG on disk.
+
+In the Markdown log each screenshot is embedded as an Obsidian wikilink using only the filename (`![[R02-001_00-12-34.jpg]]`), so Obsidian resolves it vault-wide without any folder path; other Markdown viewers can find the file under the project's `Screenshots/` folder.

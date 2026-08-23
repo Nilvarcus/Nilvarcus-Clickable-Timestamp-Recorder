@@ -19,7 +19,7 @@ Clickable Timestamp Recorder helps creators attach short microphone notes to exa
 - Configurable global timestamp hotkey through `pynput`.
 - Detection of OBS recordings that were already active when connecting.
 - Built-in ▶/■ timer: full timestamp sessions without OBS open.
-- Recent-projects popup: the five most recently opened projects load with one click from the project-name field.
+- Recent-projects popup: the five most recently opened projects load with one click from the project-name field; rows show each project's timestamp/recording counts, and a 🗑 button deletes projects (folder to Recycle Bin) from the same popup.
 - Per-timestamp context screenshots: a 720p-height main-monitor JPEG saved into `Screenshots/` and embedded in the Markdown log.
 
 ## Deliberate limitations

@@ -25,7 +25,8 @@ Contains GUI-independent functionality:
 
 - `TimestampEntry`: persisted timestamp state (`kind` distinguishes regular timestamps from automatic replay-buffer entries; replay entries carry `replay_file`).
 - `TimestampSession`: project timer, IDs, JSON persistence, Markdown generation, and safe filenames; `rename_tag()`/`remove_tag()` propagate tag-library edits across entries (case-insensitive, bypassing the recording-row edit lock) and persist like any other change.
-- `sanitize_recent_projects` / `update_recent_projects`: pure helpers behind the five-slot recent-projects list stored in `keybinds.json`.
+- `sanitize_recent_projects` / `update_recent_projects` / `remove_recent_project`: pure helpers behind the five-slot recent-projects list stored in `keybinds.json`.
+- `read_project_stats`: reads one project's `session.json` defensively and returns its timestamp/segment counts for the recent-projects popup rows (zeros on missing or corrupt data).
 - `sanitize_tag_definitions` / `normalize_tag_name` / `is_valid_hex_color`: pure helpers validating the `tags` key and normalizing tag names everywhere (config load and the tag manager share them).
 - `AudioRecorder`: one active `sounddevice.RawInputStream` and WAV writer.
 - `PlaybackController`: Windows-native WAV playback and stop behavior.
@@ -134,7 +135,7 @@ Without a selected project the save is announced but not logged. Replay rows reu
 
 Each project folder contains:
 
-- `<Project Name>.md`: readable log with one section per recording segment, relative links to completed WAV files, and an embedded `![Screenshot]` line under each captured timestamp.
+- `<Project Name>.md`: readable log with one section per recording segment, relative links to completed WAV files, and an embedded screenshot line under each captured timestamp (an Obsidian wikilink embed using the bare filename: `![[R##-###_HH-MM-SS.jpg]]`).
 - `session.json`: project name, timer metadata, recording segments, timestamp states, file paths, durations, and relative screenshot filenames.
 - `R##-###_HH-MM-SS.wav`: microphone recordings, named after their segment and per-segment index.
 - `Screenshots/R##-###_HH-MM-SS.jpg`: per-timestamp main-monitor snapshots (720p-height JPEG).

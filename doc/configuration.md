@@ -37,7 +37,7 @@ Example:
 - `keybinds.mark_time`: normalized pynput keyboard name; default `f15`.
 - `output_folder`: parent folder for project folders. If missing, the app uses `Timestamp_Audio` beside the application.
 - `project_name`: last entered project name, used to prefill the project field.
-- `recent_projects`: up to five recently opened projects as `{"name", "output_folder"}` pairs, most recent first. Clicking the project-name field opens a popup offering them for one-click loading. The list is refreshed whenever a project is set; missing keys and malformed entries are ignored.
+- `recent_projects`: up to five recently opened projects as `{"name", "output_folder"}` pairs, most recent first. Clicking the project-name field opens a popup offering them for one-click loading; each row shows the project's timestamp/recording counts from its `session.json`. The 🗑 button recycles a project's folder to the Recycle Bin (after confirmation) and removes its entry, persisting this key immediately. The list is refreshed whenever a project is set; missing keys and malformed entries are ignored.
 - `obs_settings.host`: OBS WebSocket hostname; default `localhost`.
 - `obs_settings.port`: OBS WebSocket port; default `4455`.
 - `obs_settings.password`: OBS WebSocket password, if configured.
