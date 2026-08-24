@@ -29,7 +29,15 @@ Or launch the latest packaged build at `dist/timestamp_gui_lite.exe`.
 
 The timer starts automatically when OBS starts recording. The **New timestamp** button and configured hotkey become available. To work without OBS, click **▶ Start timer** instead — see [Timer without OBS](#timer-without-obs).
 
-Clicking the **project name field** opens a popup listing your five most recent projects; pick one to reopen it instantly (its output folder and session load together). Each row shows the project's activity — `12 timestamps · 3 recordings`, read live from its log — instead of the folder path, plus a 🗑 delete button: after a confirmation the project's folder moves to the Recycle Bin and the entry disappears from the list. The project you currently have open can't be deleted until you switch to another one, a failed recycle keeps the entry, and an entry whose folder is already gone shows `(folder missing)` and removes itself from the list without touching anything. Typing a fresh name works as usual — any keypress dismisses the popup.
+Clicking the **project name field** opens a popup listing your five most recent projects; picking one reopens it instantly (output folder and session load together).
+
+Each row shows:
+
+- The project's activity — `12 timestamps · 3 recordings`, read live from its log — instead of the folder path.
+- A 🗑 delete button: after a confirmation, the project's folder moves to the Recycle Bin and the entry disappears from the list. The project you currently have open can't be deleted until you switch to another one; a failed recycle keeps the entry; an entry whose folder is already gone shows `(folder missing)` and removes itself from the list without touching anything.
+- An ✎ rename button that renames the project (folder, markdown file, and session metadata) and is blocked for the currently open project.
+
+Typing a fresh name works as usual — any keypress dismisses the popup.
 
 ## Timer without OBS
 
@@ -52,7 +60,14 @@ If OBS starts while the manual timer already runs, the live segment simply conti
 5. Click the recording row again to stop and save the WAV file.
 6. Click the completed row to play or stop the recording.
 
-While a recording runs, a small 🎤 level bar appears beside the status bar so you can see the microphone is actually picking you up. If no audio comes through at all, the app stops the capture by itself, throws the silent take away, and shows **No microphone input detected — check the selected mic and try again.** A first recording goes back to its grey record-me state; an aborted retake on an already-saved timestamp keeps its previous audio and stays green. The threshold and timeout are adjustable under `mic_settings` in `keybinds.json` (see [configuration.md](configuration.md)).
+While a recording runs, a small 🎤 level bar appears beside the status bar so you can see the microphone is actually picking you up.
+
+If no audio comes through at all, the silence watchdog steps in:
+
+- The app stops the capture by itself, throws the silent take away, and shows **No microphone input detected — check the selected mic and try again.**
+- Any real input at any point in the take permanently disarms the auto-stop — pausing during speech never deletes recorded audio.
+- A first recording goes back to its grey record-me state; an aborted retake on an already-saved timestamp keeps its previous audio and stays green.
+- The threshold and timeout are adjustable under `mic_settings` in `keybinds.json` (see [configuration.md](configuration.md)).
 
 When the timer stops — from OBS or the in-app button — the app finalizes an active note and locks only *creating new* timestamps. Existing rows stay usable: pending notes can still record audio and saved notes play back anytime.
 

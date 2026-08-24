@@ -34,4 +34,4 @@ Clickable Timestamp Recorder helps creators attach short microphone notes to exa
 - Audio is mono 16-bit PCM WAV.
 - A process restart cannot resume an active microphone stream or OBS timer; interrupted entries return to pending state.
 - Project Markdown links are local relative links and are intended to remain beside their WAV files.
-- There is no cloud sync, database, multi-user mode, video capture, transcription, or editing system.
+- There is no cloud sync, database, multi-user mode, video capture, or editing system, and no built-in transcription: transcripts exist only as output of the optional offline script `scripts/transcribe_timestamps.py`, never of the app itself.

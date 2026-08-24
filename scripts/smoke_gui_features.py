@@ -14,6 +14,8 @@ Steps exercised:
   5. Watchdog finalize-on-transition regression: repeated "waiting" passes
      with OBS off never kill a manual timer/mic recording; only a real
      connected→dropped transition does.
+  6. Recent-projects popup follows main-window moves/resizes while open
+     and is dismissed when the window is minimized.
 """
 
 from __future__ import annotations
@@ -282,6 +284,75 @@ def main() -> int:
             app.recorder = real_recorder
             app.recording_entry_id = None
             app._stop_mic_meter()
+
+        # ── 7. Recent-projects popup follows window moves ────────────────
+        # The popup is an overrideredirect Toplevel pinned once by absolute
+        # screen coordinates; root <Configure> bindings must re-anchor it
+        # while open, and an <Unmap> (minimize) must dismiss it.
+        for seed in ("Popup Alpha", "Popup Beta"):
+            os.makedirs(os.path.join(temp_output, seed), exist_ok=True)
+        app.recent_projects = [
+            {
+                "name": "Popup Alpha",
+                "output_folder": os.path.join(temp_output, "Popup Alpha"),
+            },
+            {
+                "name": "Popup Beta",
+                "output_folder": os.path.join(temp_output, "Popup Beta"),
+            },
+        ]
+        app._open_recent_popup()
+        popup = app._recent_popup
+        check(
+            "recent popup opened with seeded projects",
+            popup is not None and popup.winfo_exists(),
+        )
+        pump(root, 0.4)
+
+        # Moving the window must move the popup by the same delta. Compare
+        # against the root's ACTUAL displacement, not the requested one:
+        # Windows may adjust the applied offset (frame/DPI rounding).
+        root_x, root_y = root.winfo_rootx(), root.winfo_rooty()
+        pop_x, pop_y = popup.winfo_rootx(), popup.winfo_rooty()
+        dx, dy = 120, 80
+        root.geometry(f"+{root_x + dx}+{root_y + dy}")
+        pump(root, 0.5)
+        actual_dx = root.winfo_rootx() - root_x
+        actual_dy = root.winfo_rooty() - root_y
+        print(f"    (requested ({dx}, {dy}), client moved ({actual_dx}, {actual_dy}))")
+        check(
+            f"popup follows window move (client delta {actual_dx}, {actual_dy})",
+            abs(actual_dx) > 0
+            and abs(actual_dy) > 0
+            and abs(popup.winfo_rootx() - (pop_x + actual_dx)) <= 2
+            and abs(popup.winfo_rooty() - (pop_y + actual_dy)) <= 2,
+        )
+
+        # Shrinking the window keeps the popup clamped inside its bounds.
+        old_geometry = root.geometry()
+        root_x, root_y = root.winfo_rootx(), root.winfo_rooty()
+        root.geometry(f"500x620+{root_x}+{root_y}")
+        pump(root, 0.5)
+        pop_w, pop_h = popup.winfo_width(), popup.winfo_height()
+        check(
+            "popup stays clamped inside a shrunken window",
+            popup.winfo_rootx() >= root.winfo_rootx() - 2
+            and popup.winfo_rooty() >= root.winfo_rooty() - 2
+            and popup.winfo_rooty() + pop_h
+            <= root.winfo_rooty() + root.winfo_height() + 2,
+        )
+        print(f"    (popup {pop_w}x{pop_h} in 500x620 window)")
+
+        # Minimizing unmaps the main window and must dismiss the popup.
+        root.iconify()
+        pump(root, 0.5)
+        check(
+            "minimizing the window dismisses the popup",
+            app._recent_popup is None or not app._recent_popup.winfo_exists(),
+        )
+        root.deiconify()
+        root.geometry(old_geometry)
+        pump(root, 0.3)
 
         editor.destroy()
         app.on_closing()

@@ -4,8 +4,9 @@
 
 ```bash
 python -m venv .venv
-source .venv/Scripts/activate
-python -m pip install customtkinter pynput obsws-python sounddevice mss pillow pyinstaller
+source .venv/Scripts/activate   # Git Bash
+.venv\Scripts\activate          # Command Prompt
+python -m pip install customtkinter pynput obsws-python sounddevice mss pillow send2trash pyinstaller
 ```
 
 Run from the project root:

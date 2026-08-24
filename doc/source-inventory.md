@@ -8,8 +8,8 @@
 | `timestamp_audio.py` | Timestamp/replay-entry model, recording segments, per-entry audio takes (registration/activation/removal), silence-detection helpers (`rms_int16`, `SilenceMonitor`), tag-library helpers and propagation, project persistence, Markdown generation (incl. alternate takes), microphone recording with level tracking and discard, and playback. |
 | `timestamp_obs.py` | OBS WebSocket connection with auto-reconnect watchdog, recording status, recording file path events, replay-buffer save events, and callbacks. |
 | `timestamp_screenshot.py` | Main-monitor JPEG capture (mss + Pillow) for per-timestamp context shots; pure size helper and lazily imported dependencies. |
-| `test_timestamp_audio.py` | Unit tests for core timestamp/audio-session behavior, per-entry takes (registration, activation, removal, persistence, Markdown), legacy `session.json` compatibility, mic-level/silence helpers, plus screenshot path/Markdown/capture tests. |
-| `test_timestamp_obs.py` | Dependency-light unit tests for the OBS manager: socket-liveness probe across obsws-python client layouts (fail-open on unknown shapes) and recording start/stop transition guards. |
+| `tests/test_timestamp_audio.py` | Unit tests for core timestamp/audio-session behavior, per-entry takes (registration, activation, removal, persistence, Markdown), legacy `session.json` compatibility, mic-level/silence helpers, plus screenshot path/Markdown/capture tests. |
+| `tests/test_timestamp_obs.py` | Dependency-light unit tests for the OBS manager: socket-liveness probe across obsws-python client layouts (fail-open on unknown shapes) and recording start/stop transition guards. |
 
 ## Configuration and build
 

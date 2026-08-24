@@ -152,7 +152,7 @@ KEY_REPEAT_GUARD_SECONDS = 0.3
 class TimestampApp:
     def __init__(self, root: ctk.CTk):
         self.root = root
-        self.root.title("Clickable Timestamp Recorder")
+        self.root.title("Nilvarcus Clickable Timestamp Recorder")
         self.root.geometry("720x560")
         self.root.minsize(600, 460)
         self.root.configure(fg_color=Theme.BG_DARKEST)
@@ -177,6 +177,8 @@ class TimestampApp:
         )
         self._recent_popup: ctk.CTkToplevel | None = None
         self._popup_bind_id: str | None = None
+        self._popup_configure_bind_id: str | None = None
+        self._popup_unmap_bind_id: str | None = None
 
         self.session: TimestampSession | None = None
         self.obs_manager = OBSManager()
@@ -387,18 +389,12 @@ class TimestampApp:
         self._create_footer()
 
     def _create_header(self) -> None:
-        """Single-row header: title · REC · clock · OBS status · Tags · Connect."""
+        """Single-row header: REC · clock · OBS status · Tags · Connect."""
         header = ctk.CTkFrame(self.root, fg_color=Theme.BG_SURFACE, corner_radius=12)
         header.grid(row=0, column=0, padx=14, pady=(14, 6), sticky="ew")
+        # Column 0 stays empty and takes the full stretch, acting as a left
+        # spacer so every control below remains right-aligned.
         header.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            header,
-            text="Clickable Timestamp Recorder",
-            font=Theme.FONT_TITLE,
-            text_color=Theme.TEXT_BRIGHT,
-            anchor="w",
-        ).grid(row=0, column=0, padx=(14, 8), pady=8, sticky="w")
 
         self.rec_indicator_label = ctk.CTkLabel(
             header,
@@ -928,6 +924,15 @@ class TimestampApp:
         self._popup_bind_id = self.root.bind(
             "<Button-1>", self._on_root_click_during_popup, add="+"
         )
+        # Keep the popup anchored under the field while the main window moves
+        # or resizes; an unmapped (minimized) window dismisses it so an
+        # orphaned borderless popup can never linger on screen.
+        self._popup_configure_bind_id = self.root.bind(
+            "<Configure>", self._on_root_configure_during_popup, add="+"
+        )
+        self._popup_unmap_bind_id = self.root.bind(
+            "<Unmap>", self._on_root_unmap_during_popup, add="+"
+        )
 
     def _render_recent_rows(self, popup: ctk.CTkToplevel) -> None:
         """(Re)draw the popup header plus one stats row per recent project."""
@@ -1023,13 +1028,18 @@ class TimestampApp:
         """Dismiss the recent-projects popup if it is showing."""
         popup = self._recent_popup
         self._recent_popup = None
-        bind_id = getattr(self, "_popup_bind_id", None)
-        if bind_id:
-            try:
-                self.root.unbind("<Button-1>", bind_id)
-            except KeyError:
-                pass
-            self._popup_bind_id = None
+        for attr, sequence in (
+            ("_popup_bind_id", "<Button-1>"),
+            ("_popup_configure_bind_id", "<Configure>"),
+            ("_popup_unmap_bind_id", "<Unmap>"),
+        ):
+            bind_id = getattr(self, attr, None)
+            if bind_id:
+                try:
+                    self.root.unbind(sequence, bind_id)
+                except KeyError:
+                    pass
+                setattr(self, attr, None)
         if popup is not None and popup.winfo_exists():
             popup.destroy()
 
@@ -1042,6 +1052,25 @@ class TimestampApp:
             if widget is popup:
                 return
             widget = getattr(widget, "master", None)
+        self._close_recent_popup()
+
+    def _on_root_configure_during_popup(self, event) -> None:
+        """Re-anchor the open popup when the main window moves or resizes."""
+        if self._closing:
+            return
+        popup = self._recent_popup
+        if popup is None or not popup.winfo_exists():
+            return
+        # <Configure> bindings on root also fire for child widgets via
+        # bindtag propagation; only the root window's own events may move us.
+        if event.widget is not self.root:
+            return
+        self._place_recent_popup(popup)
+
+    def _on_root_unmap_during_popup(self, event) -> None:
+        """Dismiss the popup when the main window unmaps (e.g. minimize)."""
+        if getattr(event, "widget", None) is not self.root:
+            return
         self._close_recent_popup()
 
     def _resolve_project_folder(self, name: str, stored: str) -> str:

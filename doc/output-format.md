@@ -7,8 +7,8 @@
 ├── <Project Name>.md
 ├── session.json
 ├── R##-###_HH-MM-SS.wav
-├── R##-###_HH-MM-SS.txt      # transcript (when transcribed)
-├── R##-###_HH-MM-SS.vtt      # optional VTT (when --outdir used)
+├── R##-###_HH-MM-SS.txt      # transcript (only via the optional transcribe script)
+├── R##-###_HH-MM-SS.vtt      # optional VTT (same script, when --outdir used)
 └── Screenshots/
     └── R##-###_HH-MM-SS.jpg
 ```
@@ -85,7 +85,7 @@ Replay entries (automatic OBS replay-buffer saves) sit inline between timestamps
 
 After a mic note is recorded on a replay entry, the elapsed time links to the WAV like any other entry. The `Footage` line always points at the OBS-saved replay video where it lives on disk (percent-encoded so spaces and brackets stay valid Markdown).
 
-Errors include an indented error detail below the timestamp (below the screenshot line when one exists). Transcripts, when present, appear as an indented fenced block below the screenshot/error lines (no label, to save tokens):
+Errors include an indented error detail below the timestamp (below the screenshot line when one exists). The app itself never transcribes; transcripts are written only by the optional offline script `scripts/transcribe_timestamps.py`. When present, they appear as an indented fenced block below the screenshot/error lines (no label, to save tokens):
 
 ```markdown
 - 001 [00:12:34](R01-001_00-12-34.wav) — completed, 4.2s
@@ -125,7 +125,7 @@ Each timestamp entry stores:
 - entry kind (`"timestamp"`, or `"replay"` for automatic replay-buffer entries);
 - optional relative audio filename;
 - recording duration;
-- optional `takes` list holding every retake as `{file`, duration_seconds, created_at}` entries (oldest first); `audio_file`/`duration_seconds` above always point at the *active* take;
+- optional `takes` list holding every retake as `{file, duration_seconds, created_at}` entries (oldest first); `audio_file`/`duration_seconds` above always point at the *active* take;
 - error message when applicable;
 - optional label (single-line text);
 - optional tag names (list of strings);
@@ -143,6 +143,6 @@ Audio uses mono signed 16-bit PCM WAV at 44,100 Hz. New filenames contain the se
 
 ## Screenshot files
 
-Every new timestamp captures one JPEG snapshot of the main monitor for context, stored under `Screenshots/` inside the project folder. Filenames mirror the WAV scheme with a `.jpg` extension (`R02-001_00-12-34.jpg`, legacy `{id}_HH-MM-SS.jpg`) and are made unique with a numeric suffix instead of overwriting. Captures are scaled to at most 720 px height while preserving aspect ratio (smaller monitors keep their native size) and saved as JPEG quality 100 via mss + Pillow. Capture runs on a background thread after the timestamp exists; a failed capture leaves the entry without a screenshot and never blocks creation. Deleting a timestamp keeps its JPEG on disk.
+Every new timestamp captures one JPEG snapshot of the main monitor for context, stored under `Screenshots/` inside the project folder. Filenames mirror the WAV scheme with a `.jpg` extension (`R02-001_00-12-34.jpg`, legacy `{id}_HH-MM-SS.jpg`) and are made unique with a numeric suffix instead of overwriting. Captures are scaled to at most 720 px height while preserving aspect ratio (smaller monitors keep their native size) and saved as JPEG quality 100 via mss + Pillow. Capture runs on a background thread after the timestamp exists; a failed capture leaves the entry without a screenshot and never blocks creation. Deleting a timestamp recycles its JPEG to the Recycle Bin together with every audio take; if a file is locked the entry is kept and the status bar names the blocking file.
 
 In the Markdown log each screenshot is embedded as an Obsidian wikilink using only the filename (`![[R02-001_00-12-34.jpg]]`), so Obsidian resolves it vault-wide without any folder path; other Markdown viewers can find the file under the project's `Screenshots/` folder.

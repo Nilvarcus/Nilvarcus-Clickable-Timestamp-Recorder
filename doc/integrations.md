@@ -8,10 +8,10 @@ The app uses OBS WebSocket v5 through `obsws-python`.
 
 1. In OBS, open **Tools → WebSocket Server Settings**.
 2. Enable the WebSocket server.
-3. Confirm the port, normally `4455`.
-4. Configure a password if desired.
-5. Enter matching values in `keybinds.json`.
-6. Click **Connect OBS** in the app — or just leave it to the auto-connect watchdog, which connects on its own whenever OBS is reachable and retries while it is not.
+3. Confirm the port, normally `4455`, and configure a password if desired.
+4. That is usually all: with auto-connect enabled (the default), the app connects on its own whenever OBS is reachable — the header shows amber `● Waiting for OBS…` while it retries — and follows OBS restarts automatically.
+5. If the host, port, or password differ from the defaults, enter them via the header **⚙** button (it saves and reconnects immediately). Hand-editing `keybinds.json` works too; restart the app afterwards.
+6. Manual control stays available: click **Connect OBS** or **Disconnect** in the app. Disconnecting pauses auto-connect until you click **Connect OBS** again.
 
 ### Behavior
 
