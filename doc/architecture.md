@@ -41,7 +41,7 @@ On the GUI side the repeated `"waiting"` status is *not* a session-ending signal
 
 ### `timestamp_screenshot.py`
 
-Captures the context snapshot saved next to each new timestamp. `capture_to_path` lazily imports mss and Pillow (so tests run without them), grabs OS primary monitor 1 in physical pixels, converts BGRA→RGB, scales to at most 720 px height without upscaling, and writes JPEG quality 100. `compute_target_size` is a pure function so the scaling rule is unit-testable. Failures raise `ScreenshotError`; callers keep the timestamp valid.
+Captures the context snapshot saved next to each new timestamp. `capture_to_path` lazily imports mss and Pillow (so tests run without them), grabs the OS primary display in physical pixels (identified by its virtual-screen origin `(0, 0)` via `select_primary_monitor`, since mss's monitor order is not guaranteed to put the primary first; falls back to `monitors[1]`), converts BGRA→RGB, scales to at most 720 px height without upscaling, and writes JPEG quality 100. `compute_target_size` is a pure function so the scaling rule is unit-testable. Failures raise `ScreenshotError`; callers keep the timestamp valid.
 
 ### `timestamp_gui.spec`
 
@@ -53,9 +53,12 @@ Builds the windowed PyInstaller executable and bundles the `_sounddevice_data` P
 
 ```text
 OBS output-start event or initial record-status query
-  → OBSManager._recording_active = True
+  → OBSManager._recording_active = True (main) or _vertical_recording_active = True
+    (Aitum Vertical vendor event / vendor status query)
+  → combined-state transition detected in _recompute_recording_activity()
   → on_recording_started callback (carries the recording file path from
-    RecordStateChanged.outputPath when OBS reported it)
+    RecordStateChanged.outputPath when OBS reported it, or the path queried
+    from the vertical recording output's settings)
   → root.after(0, TimestampApp._start_obs_timer)
   → TimestampSession.start_timer(recording_name)   # opens a numbered segment
   → TimestampSession.set_recording_path(number, path)   # when OBS reported one
@@ -63,6 +66,8 @@ OBS output-start event or initial record-status query
 ```
 
 The segment name is derived from the OBS recording file name (basename without extension). When the app connects while OBS is already recording, no file path is available yet; the segment starts unnamed and is renamed via `TimestampSession.name_recording` when the stop event reveals the final path. The full video path is kept on the segment (`RecordingInfo.path`) via `set_recording_path` — the start event fills it immediately, and the stop event confirms or corrects it.
+
+Main and Aitum Vertical recordings are independent output objects that are merged by the combined-state transition logic: the started/stopped callbacks fire only when the merged (main OR vertical) recording state flips, so overlapping recordings share one segment and the timer runs until both have stopped.
 
 ### Manual timer (OBS-free sessions)
 

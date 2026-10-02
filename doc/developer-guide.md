@@ -43,7 +43,8 @@ The spec creates `dist/timestamp_gui_lite.exe` and bundles CustomTkinter, OBS We
 - Keep GUI-independent session/audio behavior in `timestamp_audio.py`.
 - Keep OBS protocol behavior in `timestamp_obs.py`; do not import Tkinter there.
 - Route OBS and pynput callbacks into Tk with `root.after(0, ...)`.
-- Update `session.json` and regenerate the Markdown log whenever persisted timestamp state changes.
+- Update `session.json` and regenerate the Markdown log whenever persisted timestamp state changes. `session.json` writes are always synchronous; the Markdown regeneration may be debounced by the GUI (`TimestampSession.markdown_autoflush = False` + `flush_markdown()`, default `True` keeps everything synchronous for tests and direct consumers).
+- Keep the timestamp list refresh cheap: rows are cached and carry change signatures — never reconfigure a row whose entry did not change, and never call `update_idletasks()` on refresh paths.
 - Add tests for filename, persistence, or state changes before changing the data model.
 - Update the relevant `doc/` page and README when behavior changes.
 - Do not reintroduce removed integrations without an explicit product decision.

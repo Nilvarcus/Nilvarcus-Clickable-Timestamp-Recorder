@@ -6,6 +6,10 @@ project logs keep visual context next to each entry. Pixel capture uses mss
 uses Pillow. Both dependencies are imported lazily inside the capture call, so
 the pure helpers and every session/path test run without a display or the
 dependencies installed.
+
+The primary display is identified by its position — it always sits at the
+virtual-screen origin (0, 0) — because mss orders its per-monitor list by OS
+enumeration order, which is not guaranteed to put the primary first.
 """
 
 from __future__ import annotations
@@ -56,6 +60,29 @@ def _dependencies():
     return mss, Image
 
 
+def select_primary_monitor(monitors: list[dict]) -> dict:
+    """Return the mss monitor dict for the OS primary display.
+
+    mss lists monitor 0 as the all-displays bounding box and the individual
+    displays afterwards, but the enumeration order is OS-defined: on Windows
+    the primary is not guaranteed to be ``monitors[1]``. Prefer the explicit
+    ``is_primary`` flag newer mss releases provide; otherwise pick the
+    per-monitor entry whose top-left corner is the virtual-screen origin
+    (0, 0), where the primary always sits. Falls back to ``monitors[1]``
+    when no entry matches (degenerate layouts). Raises ScreenshotError on
+    an empty list.
+    """
+    if not monitors:
+        raise ScreenshotError("No monitors detected")
+    for monitor in monitors[1:]:
+        if monitor.get("is_primary") is True:
+            return monitor
+    for monitor in monitors[1:]:
+        if monitor.get("left") == 0 and monitor.get("top") == 0:
+            return monitor
+    return monitors[1]
+
+
 def capture_to_path(output_path: str) -> str:
     """Capture the main monitor and save a 720p-height JPEG.
 
@@ -70,8 +97,10 @@ def capture_to_path(output_path: str) -> str:
         # releases only ship the mss() factory function.
         scanner_factory = getattr(mss, "MSS", None) or mss.mss
         with scanner_factory() as scanner:
-            # Monitor 0 spans all displays; monitor 1 is the OS primary.
-            raw = scanner.grab(scanner.monitors[1])
+            # Monitor 0 spans all displays; the primary is the per-monitor
+            # entry at the virtual-screen origin (index 1 is not guaranteed
+            # to be the primary).
+            raw = scanner.grab(select_primary_monitor(scanner.monitors))
         # mss delivers BGRA byte order; map it onto RGB pixels directly.
         image = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
         target_size = compute_target_size(*image.size)

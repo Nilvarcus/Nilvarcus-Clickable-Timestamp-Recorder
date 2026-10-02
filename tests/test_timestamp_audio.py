@@ -43,7 +43,11 @@ from timestamp_audio import (
     sanitize_tag_definitions,
     update_recent_projects,
 )
-from timestamp_screenshot import ScreenshotError, compute_target_size
+from timestamp_screenshot import (
+    ScreenshotError,
+    compute_target_size,
+    select_primary_monitor,
+)
 
 
 class AudioDeviceTests(unittest.TestCase):
@@ -186,6 +190,69 @@ class TimestampSessionTests(unittest.TestCase):
             self.assertEqual(data["entries"][0]["id"], 1)
             self.assertEqual(data["recordings"], [])
             self.assertEqual(data["next_recording_number"], 1)
+
+
+class MarkdownDebounceTests(unittest.TestCase):
+    """markdown_autoflush=False: Markdown writes are deferred to flush_markdown()."""
+
+    def test_default_autoflush_writes_markdown_on_save(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project_folder = os.path.join(folder, "My Project")
+            session = TimestampSession(project_folder, "My Project", load_existing=False)
+            self.assertTrue(session.markdown_autoflush)
+            session.create_timestamp(10)
+            self.assertFalse(session.markdown_dirty)
+            self.assertTrue(os.path.isfile(os.path.join(project_folder, "My Project.md")))
+
+    def test_deferred_save_writes_json_but_not_markdown(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project_folder = os.path.join(folder, "My Project")
+            session = TimestampSession(project_folder, "My Project", load_existing=False)
+            session.markdown_autoflush = False
+            session.create_timestamp(10)
+            self.assertTrue(session.markdown_dirty)
+            self.assertFalse(os.path.isfile(os.path.join(project_folder, "My Project.md")))
+            # JSON is still synchronous: a fresh session sees the entry.
+            restored = TimestampSession(project_folder, "My Project")
+            self.assertEqual(len(restored.entries), 1)
+
+    def test_flush_markdown_writes_file_and_clears_dirty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project_folder = os.path.join(folder, "My Project")
+            markdown_path = os.path.join(project_folder, "My Project.md")
+            session = TimestampSession(project_folder, "My Project", load_existing=False)
+            session.markdown_autoflush = False
+            session.create_timestamp(10)
+            self.assertTrue(session.markdown_dirty)
+            session.flush_markdown()
+            self.assertFalse(session.markdown_dirty)
+            self.assertTrue(os.path.isfile(markdown_path))
+            with open(markdown_path, encoding="utf-8") as handle:
+                self.assertIn("# My Project", handle.read())
+
+    def test_flush_markdown_is_noop_when_clean(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project_folder = os.path.join(folder, "My Project")
+            session = TimestampSession(project_folder, "My Project", load_existing=False)
+            session.markdown_autoflush = False
+            session.create_timestamp(10)
+            session.flush_markdown()
+            # Nothing changed since; the second flush must not rewrite.
+            os.remove(os.path.join(project_folder, "My Project.md"))
+            session.flush_markdown()
+            self.assertFalse(os.path.isfile(os.path.join(project_folder, "My Project.md")))
+
+    def test_later_mutation_after_flush_marks_dirty_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project_folder = os.path.join(folder, "My Project")
+            session = TimestampSession(project_folder, "My Project", load_existing=False)
+            session.markdown_autoflush = False
+            session.create_timestamp(10)
+            session.flush_markdown()
+            session.create_timestamp(20)
+            self.assertTrue(session.markdown_dirty)
+            session.flush_markdown()
+            self.assertFalse(session.markdown_dirty)
 
 
 class TimestampAnnotationTests(unittest.TestCase):
@@ -685,6 +752,49 @@ class ScreenshotSupportTests(unittest.TestCase):
     def test_compute_target_size_rejects_invalid_sizes(self):
         with self.assertRaises(ScreenshotError):
             compute_target_size(0, 720)
+
+    def test_select_primary_monitor_prefers_origin_over_list_position(self):
+        all_monitors = {"left": -1920, "top": -200, "width": 4480, "height": 1300}
+        secondary = {"left": 2560, "top": 0, "width": 1920, "height": 1080}
+        primary = {"left": 0, "top": 0, "width": 2560, "height": 1440}
+
+        # Secondary enumerated first (the observed Windows misordering).
+        self.assertIs(select_primary_monitor([all_monitors, secondary, primary]), primary)
+        # Primary enumerated first still wins by origin, not by index.
+        self.assertIs(select_primary_monitor([all_monitors, primary, secondary]), primary)
+
+    def test_select_primary_monitor_handles_negative_secondary_offsets(self):
+        all_monitors = {"left": -1920, "top": 0, "width": 3840, "height": 1080}
+        secondary = {"left": -1920, "top": 0, "width": 1920, "height": 1080}
+        primary = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+        self.assertIs(select_primary_monitor([all_monitors, secondary, primary]), primary)
+
+    def test_select_primary_monitor_prefers_explicit_is_primary_flag(self):
+        all_monitors = {"left": -1920, "top": 0, "width": 5760, "height": 1080}
+        secondary = {
+            "left": -1920,
+            "top": 0,
+            "width": 1920,
+            "height": 1080,
+            "is_primary": False,
+        }
+        primary = {
+            "left": 0,
+            "top": 0,
+            "width": 1920,
+            "height": 1080,
+            "is_primary": True,
+        }
+        self.assertIs(select_primary_monitor([all_monitors, secondary, primary]), primary)
+
+    def test_select_primary_monitor_falls_back_to_index_one(self):
+        all_monitors = {"left": -1920, "top": -200, "width": 4480, "height": 1300}
+        first = {"left": 2560, "top": 100, "width": 1920, "height": 1080}
+        second = {"left": -1920, "top": 0, "width": 1920, "height": 1080}
+        self.assertIs(select_primary_monitor([all_monitors, first, second]), first)
+    def test_select_primary_monitor_rejects_empty_list(self):
+        with self.assertRaises(ScreenshotError):
+            select_primary_monitor([])
 
     def test_screenshot_path_mirrors_segmented_audio_naming(self):
         with tempfile.TemporaryDirectory() as folder:

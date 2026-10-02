@@ -73,7 +73,7 @@ When the timer stops — from OBS or the in-app button — the app finalizes an 
 
 ### Reading the timestamp list
 
-Each timestamp is one compact row. A colored dot shows the state: grey pending, red recording (or error), green saved, blue while playing, violet for replay entries. The row itself is the button — clicking anywhere on it records, stops, or plays exactly as before. After the `R##-###` reference and time you'll see the entry's label in quotes and up to three tag chips (more tags collapse into a `+N` chip). The small icons at the end open the timestamp's screenshot (📷, timestamps only), record another take (🎙, completed timestamps only — see *Retakes* below), open the replay video (🎬, replays only), edit label/tags (✎), and delete the entry (✕). The **📷** icon stays greyed out until the snapshot has finished saving (and on older entries created before screenshots existed); if the JPEG was moved or deleted, clicking it shows an error in the status bar instead.
+Each timestamp is one compact row. A colored dot shows the state: grey pending, red recording (or error), green saved, blue while playing; replay entries are amber until an audio take is recorded, then green (red while recording/failed). The row itself is the button — clicking anywhere on it records, stops, or plays exactly as before. After the `R##-###` reference and time you'll see the entry's label in quotes and up to three tag chips (more tags collapse into a `+N` chip). The small icons at the end open the timestamp's screenshot (📷, timestamps only), record another take (🎙, completed timestamps only — see *Retakes* below), open the replay video (🎬, replays only), edit label/tags (✎), and delete the entry (✕). The **📷** icon stays greyed out until the snapshot has finished saving (and on older entries created before screenshots existed); if the JPEG was moved or deleted, clicking it shows an error in the status bar instead.
 
 The list follows you while you work: as long as you're already near the bottom, every new timestamp (hotkey, ＋ button, manual entry, or OBS replay save) scrolls itself into view. Scroll up to read older entries and it stops following — scroll back down and it picks up where it left off. Opening or switching a project always lands you on the latest segment.
 
@@ -89,10 +89,13 @@ A saved note is never final. Every timestamp can hold several **takes**; the new
 
 ## Replay-buffer saves
 
-If OBS has its replay buffer enabled, every time you save a replay (OBS default hotkey) while the app is connected, a violet **🎬 REPLAY** entry appears automatically between your timestamps, named after the replay file (for example `replay- [21-08][17-44-10]`).
+If OBS has its replay buffer enabled, every time you save a replay (OBS default hotkey) while the app is connected, a **🎬 REPLAY** entry appears automatically between your timestamps, named after the replay file (for example `replay- [21-08][17-44-10]`).
 
 - Treat it like any timestamp: click to record a microphone note, click again to stop, then click to play.
+- The row shows its audio state at a glance: an **amber** dot and `· no audio — click to record` while it has no saved take, **red** while recording or after a failed take, and **green** with `· audio N.Ns` once a take exists (blue with a ■ stop suffix while playing).
 - The **🎬** button on the row opens the replay video in your default video player; if the file was moved or deleted, the status bar shows an error.
+- Completed replays also carry the 🎙 quick-take button for recording another take without opening the edit dialog.
+- The **Missing audio** checkbox next to the 🔍 filter box shows only replay entries without a saved take (pending or failed) — handy for finding which of a burst of clips still need a note. A replay you are currently recording is hidden until the take finishes; combine it with the text filter freely. It resets when you switch projects.
 - Use **✎** to add a label and tags, and **✕** to delete the entry (its microphone-note WAV is deleted with it, while the replay video is never touched).
 - Saves are logged even when the timer is stopped — they attach to the most recent recording segment. A project must be selected, otherwise the save is announced in the status bar only.
 - Saving the same replay twice never creates two entries.

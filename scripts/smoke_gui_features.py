@@ -16,6 +16,9 @@ Steps exercised:
      connected→dropped transition does.
   6. Recent-projects popup follows main-window moves/resizes while open
      and is dismissed when the window is minimized.
+  7. Replay rows expose audio state (amber no-audio, red recording,
+     green with duration, 🎙 quick-take button) and the toolbar
+     Missing-audio toggle filters to replays without a saved take.
 """
 
 from __future__ import annotations
@@ -116,6 +119,13 @@ def main() -> int:
         markdown_path = os.path.join(temp_output, "Smoke Tags", "Smoke Tags.md")
         with open(markdown_path, "r", encoding="utf-8") as handle:
             markdown = handle.read()
+        check(
+            "markdown debounced after tag rename (not yet rewritten)",
+            "#boss" not in markdown and app.session.markdown_dirty,
+        )
+        app.session.flush_markdown()
+        with open(markdown_path, "r", encoding="utf-8") as handle:
+            markdown = handle.read()
         check("markdown rewritten with new tag", "#boss" in markdown)
 
         # ── 3. Edit dialog chips refresh live ────────────────────────────
@@ -152,6 +162,7 @@ def main() -> int:
             "deleted tag removed from keybinds.json",
             all(t["name"] != "boss" for t in persisted.get("tags", [])),
         )
+        app.session.flush_markdown()
         with open(markdown_path, "r", encoding="utf-8") as handle:
             markdown = handle.read()
         check("markdown no longer lists deleted tag", "#boss" not in markdown)
@@ -355,6 +366,132 @@ def main() -> int:
         pump(root, 0.3)
 
         editor.destroy()
+
+        # ── 8. Replay audio-state rows + Missing-audio toggle ──────────
+        # Replay rows must expose their audio state in the main list:
+        # amber "no audio" while pending, red while recording, green with
+        # duration once a take exists — plus the toolbar Missing-audio
+        # toggle that filters to replays without a saved take.
+        Theme = timestamp_gui.Theme
+        replay_done = app.session.create_replay_entry(
+            os.path.join(temp_output, "replay-done.mp4")
+        )
+        replay_missing = app.session.create_replay_entry(
+            os.path.join(temp_output, "replay-missing.mp4")
+        )
+        # Direct session calls don't repaint on their own; the production
+        # replay path schedules the refresh via _on_obs_replay_saved.
+        app._schedule_list_refresh()
+        pump(root, 0.4)
+        w_done = app._list_rows.get(replay_done.id)
+        w_missing = app._list_rows.get(replay_missing.id)
+        check("replay rows rendered in the list", w_done is not None and w_missing is not None)
+        if w_done is not None and w_missing is not None:
+            check(
+                "pending replay row is amber with a no-audio hint",
+                "no audio" in w_missing["label"].cget("text")
+                and w_missing["dot"].cget("text_color") == Theme.AMBER,
+            )
+            check(
+                "pending replay quick-take button is hidden",
+                not w_missing["take_button"].winfo_ismapped(),
+            )
+
+            stub = StubRecorder(app.session.output_dir)
+            real_recorder = app.recorder
+            app.recorder = stub
+            try:
+                # Recording state: red row + ■ Stop button.
+                app.recording_entry_id = replay_missing.id
+                app.session.mark_recording(replay_missing)
+                app._schedule_list_refresh()
+                pump(root, 0.3)
+                check(
+                    "recording replay row is red with a recording hint",
+                    "recording — click to stop" in w_missing["label"].cget("text")
+                    and w_missing["dot"].cget("text_color") == Theme.RED
+                    and w_missing["take_button"].cget("text") == "■ Stop",
+                )
+                # Completing the take: green row with duration + take button.
+                app._stop_entry_recording(replay_missing)
+                pump(root, 0.3)
+                done_entry = app.session.get(replay_missing.id)
+                check(
+                    "completed replay row is green with audio duration",
+                    done_entry.status == "completed"
+                    and "audio" in w_missing["label"].cget("text")
+                    and w_missing["dot"].cget("text_color") == Theme.GREEN
+                    and w_missing["take_button"].cget("text") == "🎙",
+                )
+
+                # Missing-audio toggle: only replay entries without a saved
+                # take stay visible (a recording-in-progress row hides too).
+                app.missing_audio_checkbox.select()
+                app._on_missing_audio_toggle()
+                pump(root, 0.4)
+                check(
+                    "toggle hides replays that have audio",
+                    not w_missing["frame"].winfo_ismapped()
+                    and w_done["frame"].winfo_ismapped(),
+                )
+                # A second pending replay stays visible under the toggle.
+                replay_late = app.session.create_replay_entry(
+                    os.path.join(temp_output, "replay-late.mp4")
+                )
+                app._schedule_list_refresh()
+                pump(root, 0.4)
+                w_late = app._list_rows.get(replay_late.id)
+                check(
+                    "toggle keeps pending replays visible",
+                    w_late is not None and w_late["frame"].winfo_ismapped(),
+                )
+                # A currently-recording replay is excluded (being handled).
+                app.recorder = StubRecorder(app.session.output_dir)
+                app.recording_entry_id = replay_late.id
+                app.session.mark_recording(replay_late)
+                app._schedule_list_refresh()
+                pump(root, 0.4)
+                check(
+                    "toggle hides a currently-recording replay",
+                    not w_late["frame"].winfo_ismapped(),
+                )
+                app._stop_entry_recording(replay_late)
+                # Complete the last pending replay too, so every replay has
+                # audio and the toggle filters out everything: the list
+                # then shows its own "no replays missing" placeholder.
+                app.recorder = StubRecorder(app.session.output_dir)
+                app.recording_entry_id = replay_done.id
+                app.session.mark_recording(replay_done)
+                app._schedule_list_refresh()
+                pump(root, 0.4)
+                app._stop_entry_recording(replay_done)
+                pump(root, 0.5)
+                check(
+                    "empty placeholder celebrates no missing audio",
+                    app._empty_label is not None
+                    and "No replays missing audio" in app._empty_label.cget("text"),
+                )
+                # Unchecking restores every row (recreated after the
+                # placeholder branch dropped the cached widgets).
+                app.missing_audio_checkbox.deselect()
+                app._on_missing_audio_toggle()
+                pump(root, 0.5)
+                restored = all(
+                    app._list_rows.get(eid) is not None
+                    and app._list_rows[eid]["grid_row"] is not None
+                    for eid in (replay_done.id, replay_missing.id, replay_late.id)
+                )
+                check(
+                    "unchecking the toggle restores all replay rows",
+                    restored,
+                )
+            finally:
+                app.recorder = real_recorder
+                app.recording_entry_id = None
+                app._stop_mic_meter()
+                app.missing_audio_checkbox.deselect()
+                app._missing_audio_only = False
+
         app.on_closing()
         root = None
     finally:

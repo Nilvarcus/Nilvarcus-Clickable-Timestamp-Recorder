@@ -95,7 +95,7 @@ Errors include an indented error detail below the timestamp (below the screensho
     ```
 ```
 
-The Markdown is regenerated from `session.json` on every session state save.
+The Markdown is regenerated from `session.json` on every session state save. To keep long sessions snappy, the GUI coalesces these regenerations: `session.json` (with its backup) is written synchronously on every mutation, while the Markdown write is debounced to run once ~1 s after the last change and flushed immediately before the app closes or a project is switched/removed — so the log can momentarily lag up to ~1 s behind the actions, but never a destructive operation.
 
 Timestamps recorded more than once keep every take; each non-active take is listed as an indented link below the screenshot/error lines (the active take is already the headline link):
 

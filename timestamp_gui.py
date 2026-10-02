@@ -227,6 +227,9 @@ class TimestampApp:
         self._obs_last_failure_reason: str | None = None
         self._filter_text: str = ""
         self._filter_var: tk.StringVar | None = None
+        # "Missing audio" view toggle: shows only replay entries without a
+        # saved audio take. Transient (not persisted); reset on project switch.
+        self._missing_audio_only: bool = False
         # Timestamp-list repaint state: cached row/header/footer widgets so
         # refreshes reconfigure in place instead of destroying and recreating
         # everything (the old full-rebuild behavior flickered on every
@@ -237,6 +240,8 @@ class TimestampApp:
         self._empty_label: ctk.CTkLabel | None = None
         self._list_rows_session: TimestampSession | None = None
         self._list_refresh_job: str | None = None
+        # Debounced Markdown-log write: one trailing job per burst of saves.
+        self._markdown_flush_job: str | None = None
         # One-shot: force the next list refresh to scroll to the newest entry
         # regardless of the current scroll position (set on project load).
         self._scroll_to_bottom_on_next_refresh = False
@@ -567,6 +572,19 @@ class TimestampApp:
         self.filter_entry.pack(side="left")
         self.filter_entry.bind("<KeyRelease>", lambda _e: self._on_filter_change())
         self.filter_entry.bind("<Escape>", lambda _e: self._clear_filter())
+        # "Missing audio" toggle: when checked, the list shows only replay
+        # entries that have no saved audio take (pending or error).
+        self.missing_audio_checkbox = ctk.CTkCheckBox(
+            filter_frame,
+            text="Missing audio",
+            font=Theme.FONT_SMALL,
+            width=110,
+            height=26,
+            checkbox_width=16,
+            checkbox_height=16,
+            command=self._on_missing_audio_toggle,
+        )
+        self.missing_audio_checkbox.pack(side="left", padx=(8, 0))
         self.timer_toggle_button = ctk.CTkButton(
             toolbar,
             text="▶ Start timer",
@@ -843,16 +861,21 @@ class TimestampApp:
 
         if self.session:
             self.session.save()
+            # Flush the derived Markdown log before its session is replaced.
+            self.session.flush_markdown()
         safe_name = sanitize_project_name(project_name)
         project_folder = os.path.join(self.output_folder, safe_name)
         self.session = TimestampSession(project_folder, project_name=project_name)
+        self.session.markdown_autoflush = False
         self.session.save()
+        self.session.flush_markdown()
         self.project_name_var.set(project_name)
         self.recent_projects = update_recent_projects(
             self.recent_projects, project_name, project_folder
         )
-        # Switching projects clears any active filter.
+        # Switching projects clears any active filter (and the toggle).
         self._filter_text = ""
+        self._missing_audio_only = False
         if self._filter_var is not None:
             try:
                 self._filter_var.set("")
@@ -890,6 +913,8 @@ class TimestampApp:
 
         if self.session:
             self.session.save()
+            # Flush the derived Markdown log before dropping the session.
+            self.session.flush_markdown()
         self.output_folder = chosen
         self.session = None
         self.folder_label.configure(
@@ -1900,13 +1925,48 @@ class TimestampApp:
             self._filter_text = text
             self._schedule_list_refresh()
 
+    def _on_missing_audio_toggle(self) -> None:
+        self._missing_audio_only = bool(self.missing_audio_checkbox.get())
+        self._schedule_list_refresh()
+
     def _clear_filter(self) -> None:
         if self._filter_var:
             self._filter_var.set("")
         self._filter_text = ""
+        self._missing_audio_only = False
+        try:
+            self.missing_audio_checkbox.deselect()
+        except tk.TclError:
+            pass
         self._schedule_list_refresh()
 
+    @staticmethod
+    def _is_missing_audio_replay(entry: TimestampEntry) -> bool:
+        """A replay still needing an audio take: pending or error.
+
+        A currently-recording replay is deliberately excluded — it is being
+        handled right now — and re-enters this set if the take discards.
+        """
+        return entry.kind == "replay" and entry.status in ("pending", "error")
+
+    @property
+    def _filter_active(self) -> bool:
+        """True when any list filter is active (search text or the
+        Missing-audio toggle), so hidden rows stay cached instead of
+        being destroyed and rebuilt when the filter is later cleared."""
+        return bool(self._filter_text or self._missing_audio_only)
+
+    def _filtered_empty_text(self) -> str:
+        """Placeholder shown when the session has entries but none match."""
+        if self._filter_text:
+            return f"No timestamps match \"{self._filter_text}\" — clear the filter to see all."
+        if self._missing_audio_only:
+            return "No replays missing audio 🎉 — uncheck Missing audio to see all."
+        return "No timestamps match the active filter."
+
     def _entry_matches_filter(self, entry: TimestampEntry) -> bool:
+        if self._missing_audio_only and not self._is_missing_audio_replay(entry):
+            return False
         if not self._filter_text:
             return True
         needle = self._filter_text
@@ -1941,7 +2001,12 @@ class TimestampApp:
 
     def _schedule_list_refresh(self) -> None:
         """Coalesce list repaints: a burst of state changes produces one
-        refresh ~30 ms later instead of one full pass per mutation."""
+        refresh ~30 ms later instead of one full pass per mutation.
+
+        Every session mutation flows through here, so this is also where the
+        debounced Markdown-log write is armed (see _schedule_markdown_flush).
+        """
+        self._schedule_markdown_flush()
         if self._closing or self._list_refresh_job is not None:
             return
         try:
@@ -1955,6 +2020,27 @@ class TimestampApp:
         self._list_refresh_job = None
         if not self._closing:
             self._refresh_timestamp_list()
+
+    def _schedule_markdown_flush(self) -> None:
+        """Coalesce Markdown log writes: one flush ~1 s after the last burst.
+
+        session.json (the product's data) is written synchronously on every
+        mutation; only the derived Markdown log is debounced. Destructive
+        transitions flush immediately via explicit flush_markdown() calls.
+        """
+        if self._closing or self._markdown_flush_job is not None:
+            return
+        try:
+            self._markdown_flush_job = self.root.after(
+                1000, self._run_markdown_flush
+            )
+        except tk.TclError:
+            self._markdown_flush_job = None
+
+    def _run_markdown_flush(self) -> None:
+        self._markdown_flush_job = None
+        if not self._closing and self.session is not None:
+            self.session.flush_markdown()
 
     def _timestamp_list_canvas(self) -> tk.Canvas | None:
         """The CTkScrollableFrame's internal canvas, defensively resolved.
@@ -1980,7 +2066,15 @@ class TimestampApp:
             return True
 
     def _scroll_timestamp_list_to_bottom(self) -> None:
-        """Scroll the timestamp list to its newest entry once layout settles."""
+        """Scroll the timestamp list to its newest entry once layout settles.
+
+        No ``update_idletasks()`` here: forcing a full layout pass over every
+        widget made adding a row to a long list feel heavy. Tk runs the
+        geometry idle handlers (registered by the fresh ``grid()`` calls)
+        before this ``after_idle`` callback, so the scrollregion is already
+        up to date; a second chained idle pass retries in case layout
+        landed later than expected.
+        """
         if self._closing:
             return
 
@@ -1988,9 +2082,17 @@ class TimestampApp:
             canvas = self._timestamp_list_canvas()
             if canvas is None:
                 return
+
+            def _retry() -> None:
+                try:
+                    if canvas.yview()[1] < 0.999:
+                        canvas.yview_moveto(1.0)
+                except tk.TclError:
+                    pass
+
             try:
-                canvas.update_idletasks()  # let fresh rows update the scrollregion
                 canvas.yview_moveto(1.0)
+                canvas.after_idle(_retry)
             except tk.TclError:
                 pass
 
@@ -2054,32 +2156,45 @@ class TimestampApp:
             self._empty_label.destroy()
             self._empty_label = None
 
-        # Filtered-out: no visible entries but session has entries.
-        if self._filter_text:
-            visible = sum(1 for e in self.session.entries if self._entry_matches_filter(e))
-            if visible == 0:
+        # Single pass over the entries: group matched and unfiltered entries
+        # per recording number so the layout build below costs O(entries +
+        # recordings) instead of re-scanning every entry once per segment (and
+        # running the substring filter more than once per entry).
+        session = self.session
+        matched_by_recording: dict[int | None, list[TimestampEntry]] = {}
+        all_by_recording: dict[int | None, list[TimestampEntry]] = {}
+        matched_count = 0
+        for entry in session.entries:
+            key = entry.recording_number
+            all_by_recording.setdefault(key, []).append(entry)
+            if self._entry_matches_filter(entry):
+                matched_count += 1
+                matched_by_recording.setdefault(key, []).append(entry)
+
+        # Filtered-out: no visible entries but session has entries. (A zero
+        # match count can only happen with an active filter here, since
+        # non-empty sessions without a filter match everything.)
+        if matched_count == 0:
                 self._drop_all_rows_and_headers()
                 if self._empty_label is None:
                     self._empty_label = ctk.CTkLabel(
                         self.timestamp_list,
-                        text=f"No timestamps match \"{self._filter_text}\" — clear the filter to see all.",
+                        text=self._filtered_empty_text(),
                         font=Theme.FONT_BODY,
                         text_color=Theme.TEXT_DIM,
                         wraplength=520,
                         justify="center",
                     )
+                self._empty_label.configure(text=self._filtered_empty_text())
                 self._empty_label.grid(row=0, column=0, padx=12, pady=30)
                 return
 
         # Desired layout in display order: (kind, key, ...) items.
-        session = self.session
         items: list[tuple] = []
-        earlier = [
-            entry for entry in session.entries if entry.recording_number is None and self._entry_matches_filter(entry)
-        ]
-        earlier_all = [entry for entry in session.entries if entry.recording_number is None]
+        earlier = matched_by_recording.get(None, [])
+        earlier_all = all_by_recording.get(None, [])
         # When filtering, hide the "Earlier" header if none of its entries match.
-        if earlier_all and not earlier and self._filter_text:
+        if earlier_all and not earlier and self._filter_active:
             earlier = []
         if earlier:
             items.append(
@@ -2088,17 +2203,7 @@ class TimestampApp:
             items.extend(("entry", entry.id, entry) for entry in earlier)
 
         for recording in sorted(session.recordings, key=lambda item: item.number):
-            grouped = [
-                entry
-                for entry in session.entries
-                if entry.recording_number == recording.number and self._entry_matches_filter(entry)
-            ]
-            # Need unfiltered count to decide header visibility when not filtering.
-            grouped_all = [
-                entry
-                for entry in session.entries
-                if entry.recording_number == recording.number
-            ]
+            grouped = matched_by_recording.get(recording.number, [])
             grouped.sort(key=lambda entry: entry.recording_index or 0)
             is_live = (
                 session.timer_running
@@ -2126,6 +2231,13 @@ class TimestampApp:
 
         seen_rows: set[int] = set()
         seen_headers: set[object] = set()
+        # Playing state is the same comparison for every row: resolve the
+        # playback path once instead of calling os.path.abspath per row.
+        playback_key = (
+            os.path.abspath(self.playback.current_path)
+            if self.playback.current_path
+            else None
+        )
         for grid_row, item in enumerate(items):
             if item[0] == "header":
                 _, key, title, live, count, recording = item
@@ -2135,74 +2247,92 @@ class TimestampApp:
                     self._header_widgets[key] = widgets
                 prefix = "● " if live else ""
                 suffix = f"   ·   {count} entries" if count else ""
-                widgets["label"].configure(
-                    text=f"{prefix}{title}{suffix}",
-                    text_color=(Theme.GREEN if live else Theme.TEXT_DIM),
+                rendered = (
+                    f"{prefix}{title}{suffix}",
+                    Theme.GREEN if live else Theme.TEXT_DIM,
                 )
+                if widgets["rendered"] != rendered:
+                    widgets["label"].configure(
+                        text=rendered[0], text_color=rendered[1]
+                    )
+                    widgets["rendered"] = rendered
                 open_button = widgets["open_button"]
                 if open_button is not None:
                     # The path lands with the OBS record-start event and is
                     # confirmed by the stop event, so re-derive each refresh.
-                    open_button.configure(
-                        state="normal" if recording.path else "disabled"
+                    open_state = "normal" if recording.path else "disabled"
+                    if widgets["open_state"] != open_state:
+                        open_button.configure(state=open_state)
+                        widgets["open_state"] = open_state
+                if widgets["grid_row"] != grid_row:
+                    widgets["frame"].grid(
+                        row=grid_row, column=0, padx=0, pady=0, sticky="ew"
                     )
-                widgets["frame"].grid(
-                    row=grid_row, column=0, padx=0, pady=0, sticky="ew"
-                )
+                    widgets["grid_row"] = grid_row
                 seen_headers.add(key)
             elif item[0] == "footer":
                 _, key, footer_recording = item
-                label = self._footer_labels.get(key)
-                if label is None:
-                    label = ctk.CTkLabel(
-                        self.timestamp_list,
-                        font=Theme.FONT_SMALL,
-                        anchor="w",
-                    )
-                    self._footer_labels[key] = label
+                footer = self._footer_labels.get(key)
+                if footer is None:
+                    footer = {
+                        "label": ctk.CTkLabel(
+                            self.timestamp_list,
+                            font=Theme.FONT_SMALL,
+                            anchor="w",
+                        ),
+                        "rendered": None,
+                        "grid_row": None,
+                    }
+                    self._footer_labels[key] = footer
                     # A stop marker is new list content: let smart-follow
                     # scroll it into view like a freshly added row.
                     added_row = True
                 duration = footer_recording.duration_seconds() or 0.0
-                label.configure(
-                    text=(
-                        "■ Recording stopped — "
-                        f"{format_elapsed_display(duration)}"
-                    ),
-                    text_color=Theme.TEXT_DIM,
+                text = (
+                    "■ Recording stopped — "
+                    f"{format_elapsed_display(duration)}"
                 )
-                label.grid(row=grid_row, column=0, padx=26, pady=(0, 6), sticky="w")
+                label = footer["label"]
+                if footer["rendered"] != text:
+                    label.configure(text=text, text_color=Theme.TEXT_DIM)
+                    footer["rendered"] = text
+                if footer["grid_row"] != grid_row:
+                    label.grid(row=grid_row, column=0, padx=26, pady=(0, 6), sticky="w")
+                    footer["grid_row"] = grid_row
                 seen_headers.add(key)
             else:
                 _, entry_id, entry = item
-                if not self._entry_matches_filter(entry):
-                    # Keep cached but hidden so a cleared filter restores it without recreation.
-                    widgets = self._list_rows.get(entry_id)
-                    if widgets is not None:
-                        try:
-                            widgets["frame"].grid_remove()
-                        except tk.TclError:
-                            pass
-                        seen_rows.add(entry_id)
-                    continue
                 widgets = self._list_rows.get(entry_id)
                 if widgets is None:
                     widgets = self._create_row_widgets(entry)
                     self._list_rows[entry_id] = widgets
                     added_row = True
-                self._update_row_widgets(widgets, entry)
-                widgets["frame"].grid(
-                    row=grid_row, column=0, padx=2, pady=1, sticky="ew"
-                )
+                self._update_row_widgets(widgets, entry, playback_key)
+                if widgets["grid_row"] != grid_row:
+                    widgets["frame"].grid(
+                        row=grid_row, column=0, padx=2, pady=1, sticky="ew"
+                    )
+                    widgets["grid_row"] = grid_row
                 seen_rows.add(entry_id)
 
-        # Drop cached widgets for entries/segments that no longer exist.
+        # Drop cached widgets for entries/segments that no longer exist. With
+        # an active filter, entries that merely stopped matching keep their
+        # rows cached and hidden (grid_remove) so clearing the filter restores
+        # them without recreation; without a filter, gone rows were deleted.
         for entry_id in [eid for eid in self._list_rows if eid not in seen_rows]:
-            self._list_rows.pop(entry_id)["frame"].destroy()
+            widgets = self._list_rows.pop(entry_id)
+            if self._filter_active:
+                try:
+                    widgets["frame"].grid_remove()
+                    widgets["grid_row"] = None
+                except tk.TclError:
+                    pass
+            else:
+                widgets["frame"].destroy()
         for key in [k for k in self._header_widgets if k not in seen_headers]:
             self._header_widgets.pop(key)["frame"].destroy()
         for key in [k for k in self._footer_labels if k not in seen_headers]:
-            self._footer_labels.pop(key).destroy()
+            self._footer_labels.pop(key)["label"].destroy()
 
         if added_row and follow:
             self._scroll_timestamp_list_to_bottom()
@@ -2215,15 +2345,15 @@ class TimestampApp:
         for widgets in self._header_widgets.values():
             widgets["frame"].destroy()
         self._header_widgets.clear()
-        for label in self._footer_labels.values():
-            label.destroy()
+        for footer in self._footer_labels.values():
+            footer["label"].destroy()
         self._footer_labels.clear()
 
     def _create_row_widgets(self, entry: TimestampEntry) -> dict:
         """Build the widget tree for one compact timestamp row (once per entry).
 
         One thin line: status dot · ref+time+state text · label/tag chips ·
-        mini action icons (📷 and 🎙 on timestamps, 🎬 on replays, ✎, ✕). The whole row — frame and
+        mini action icons (📷 and 🎙 on timestamps, 🎬 and 🎙 on replays, ✎, ✕). The whole row — frame and
         every passive child including chips — forwards clicks to the same
         record/stop/play state machine the old full-width button used; only
         the icon buttons are separate click targets. Everything state-
@@ -2263,6 +2393,21 @@ class TimestampApp:
                 hover_color=Theme.VIOLET_HOVER,
                 command=lambda entry_id=entry_id: self._open_replay_video(entry_id),
             ).grid(row=0, column=next_action_column, padx=(0, 2))
+            next_action_column += 1
+            # Replays get the same quick-take control as timestamps so a
+            # clip can be (re-)recorded without opening the edit dialog.
+            # Visibility and look are driven by _update_row_widgets.
+            take_button = ctk.CTkButton(
+                actions,
+                text="🎙",
+                width=26,
+                height=22,
+                font=Theme.FONT_SMALL,
+                fg_color=Theme.BTN_SURFACE,
+                hover_color=Theme.BTN_SURFACE_HOVER,
+                command=lambda entry_id=entry_id: self._quick_take(entry_id),
+            )
+            take_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
         else:
             # Timestamps get a 📷 opener for their context screenshot. The
@@ -2329,6 +2474,8 @@ class TimestampApp:
             "label": main_label,
             "meta_frame": meta_frame,
             "meta_signature": None,
+            "signature": None,
+            "grid_row": None,
             "shot_button": shot_button,
             "take_button": take_button,
         }
@@ -2361,17 +2508,51 @@ class TimestampApp:
                 state="normal" if recording.path else "disabled",
             )
             open_button.grid(row=0, column=1, padx=(6, 0), pady=(8, 1), sticky="w")
-        return {"frame": frame, "label": label, "open_button": open_button}
+        return {
+            "frame": frame,
+            "label": label,
+            "open_button": open_button,
+            "rendered": None,
+            "open_state": None,
+            "grid_row": None,
+        }
 
-    def _update_row_widgets(self, widgets: dict, entry: TimestampEntry) -> None:
-        """Reconfigure a cached row in place to match the entry's current state."""
+    def _update_row_widgets(
+        self,
+        widgets: dict,
+        entry: TimestampEntry,
+        playback_key: str | None,
+    ) -> None:
+        """Reconfigure a cached row in place to match the entry's current state.
+
+        A full-signature skip guards everything below: entries are immutable
+        between user actions, so a steady-state refresh (no entry changed)
+        performs no ``configure`` calls at all — canvas-backed CTk widgets
+        redraw on every configure, which used to make long lists repaint
+        themselves wholesale on each refresh.
+        """
         assert self.session is not None
         is_playing = bool(
             entry.audio_file
-            and self.playback.current_path
+            and playback_key is not None
             and os.path.abspath(os.path.join(self.session.output_dir, entry.audio_file))
-            == os.path.abspath(self.playback.current_path)
+            == playback_key
         )
+        signature = (
+            entry.status,
+            entry.error,
+            entry.duration_seconds,
+            entry.audio_file,
+            entry.screenshot_file,
+            len(entry.takes),
+            is_playing,
+            entry.label,
+            tuple(entry.tags),
+            entry.elapsed_seconds,
+        )
+        if widgets["signature"] == signature:
+            return
+        widgets["signature"] = signature
 
         dot_color, text_color = self._entry_state_colors(entry, is_playing)
         widgets["dot"].configure(text_color=dot_color)
@@ -2409,10 +2590,10 @@ class TimestampApp:
             else:
                 take_button.grid_remove()
 
-        signature = (entry.label, tuple(entry.tags))
-        if widgets["meta_signature"] != signature:
+        meta_signature = (entry.label, tuple(entry.tags))
+        if widgets["meta_signature"] != meta_signature:
             self._rebuild_meta_chips(widgets["meta_frame"], entry)
-            widgets["meta_signature"] = signature
+            widgets["meta_signature"] = meta_signature
 
     def _rebuild_meta_chips(self, meta_frame: ctk.CTkFrame, entry: TimestampEntry) -> None:
         """Recreate the inline label/tag chips inside an existing frame.
@@ -2486,7 +2667,17 @@ class TimestampApp:
         """Compact single-line text: ref · time · short state hint."""
         base = f"{format_entry_ref(entry)}   {format_elapsed_display(entry.elapsed_seconds)}"
         if entry.kind == "replay":
-            return f"{base}   REPLAY {elide_middle(replay_display_name(entry.replay_file) or '', 32)}"
+            base = f"{base}   REPLAY {elide_middle(replay_display_name(entry.replay_file) or '', 32)}"
+            if entry.status == "pending":
+                return f"{base}   · no audio — click to record"
+            if entry.status == "recording":
+                return f"{base}   ● recording — click to stop"
+            if entry.status == "error":
+                reason = elide_middle(str(entry.error or "unknown error"), 40)
+                return f"{base}   · error, click to retry: {reason}"
+            audio = f"   · audio {entry.duration_seconds:.1f}s" if entry.duration_seconds else ""
+            suffix = "   ■ stop" if is_playing else ""
+            return f"{base}{audio}{suffix}"
         if entry.status == "pending":
             return f"{base}   · click to record"
         if entry.status == "recording":
@@ -2504,9 +2695,21 @@ class TimestampApp:
     def _entry_state_colors(entry: TimestampEntry, is_playing: bool) -> tuple[str, str]:
         """(dot color, text color) for one row's current state."""
         if entry.kind == "replay":
-            # Pending and error replays keep the violet identity color so
-            # they read as footage markers rather than plain timestamps.
-            return Theme.VIOLET, Theme.TEXT_BRIGHT
+            # Replay rows are state-aware so missing audio stands out:
+            # amber means the clip has no audio take yet (attention), red
+            # means recording or a failed take, green means a take exists.
+            # Identity comes from the REPLAY text and 🎬 button instead of
+            # a dedicated dot color.
+            if entry.status == "pending":
+                return Theme.AMBER, Theme.AMBER
+            if entry.status == "recording":
+                return Theme.RED, Theme.RED
+            if entry.status == "error":
+                return Theme.RED, Theme.RED
+            if entry.status == "completed":
+                if is_playing:
+                    return Theme.BLUE, Theme.BLUE
+                return Theme.GREEN, Theme.TEXT_BRIGHT
         if entry.status == "recording":
             return Theme.RED, Theme.RED
         if entry.status == "error":
@@ -2954,6 +3157,7 @@ class TimestampApp:
         self.playback.stop()
         if self.session:
             self.session.save()
+            self.session.flush_markdown()
         self._save_config()
         if hasattr(self, "_keyboard_listener") and self._keyboard_listener.running:
             self._keyboard_listener.stop()

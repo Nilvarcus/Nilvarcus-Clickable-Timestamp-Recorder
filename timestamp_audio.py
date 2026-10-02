@@ -456,6 +456,13 @@ class TimestampEntry:
 class TimestampSession:
     """Persisted collection of timestamp entries for one output folder."""
 
+    # Markdown log write policy: True (default) rewrites the Markdown log
+    # synchronously on every save(); the GUI sets False so bursts of
+    # mutations coalesce behind flush_markdown(). session.json is always
+    # written synchronously either way.
+    markdown_autoflush: bool = True
+    markdown_dirty: bool = False
+
     def __init__(
         self,
         output_dir: str,
@@ -970,6 +977,14 @@ class TimestampSession:
         return changed
 
     def save(self) -> None:
+        """Persist session state.
+
+        session.json (with its one-generation backup) is always written
+        synchronously so timestamps survive a crash. The Markdown log is
+        derived data: with the default ``markdown_autoflush = True`` it is
+        rewritten immediately; the GUI sets ``False`` so bursts of mutations
+        coalesce into one write via ``flush_markdown()``.
+        """
         os.makedirs(self.output_dir, exist_ok=True)
         # Keep one-generation backup so "restore from backup" is real.
         if os.path.isfile(self.metadata_path):
@@ -992,6 +1007,17 @@ class TimestampSession:
         with open(temporary_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
         os.replace(temporary_path, self.metadata_path)
+        if self.markdown_autoflush:
+            self.markdown_dirty = False
+            self._write_markdown()
+        else:
+            self.markdown_dirty = True
+
+    def flush_markdown(self) -> None:
+        """Write the pending debounced Markdown log (no-op when clean)."""
+        if not self.markdown_dirty:
+            return
+        self.markdown_dirty = False
         self._write_markdown()
 
     def _markdown_sections(
@@ -1000,22 +1026,24 @@ class TimestampSession:
         """Group entries into (header, entries, recording) display sections.
 
         ``recording`` is the owning segment (used for stop-duration footers)
-        or None for pre-recording entries.
+        or None for pre-recording entries. Grouping is a single pass over
+        the entries keyed by recording number, so cost is O(entries +
+        recordings) even for long sessions.
         """
         sections: list[
             tuple[str, list[TimestampEntry], Optional[RecordingInfo]]
         ] = []
-        earlier = [
-            entry for entry in self.entries if entry.recording_number is None
-        ]
+        grouped_by_number: dict[int, list[TimestampEntry]] = {}
+        earlier: list[TimestampEntry] = []
+        for entry in self.entries:
+            if entry.recording_number is None:
+                earlier.append(entry)
+            else:
+                grouped_by_number.setdefault(entry.recording_number, []).append(entry)
         if earlier:
             sections.append(("Earlier timestamps", earlier, None))
         for recording in sorted(self.recordings, key=lambda item: item.number):
-            grouped = [
-                entry
-                for entry in self.entries
-                if entry.recording_number == recording.number
-            ]
+            grouped = grouped_by_number.get(recording.number, [])
             grouped.sort(key=lambda entry: entry.recording_index or 0)
             if not grouped and recording.number != self.current_recording_number:
                 continue

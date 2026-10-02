@@ -2,7 +2,7 @@
 
 ![Clickable Timestamp Recorder](Clickable-Timestamp-Recorder-App-Image.png)
 
-A Windows-first desktop app that connects to OBS, starts its timer with OBS recording, and attaches microphone recordings to clickable timestamps.
+A Windows-first desktop app that connects to OBS, starts its timer with OBS recording (main output or Aitum Vertical), and attaches microphone recordings to clickable timestamps.
 
 ## Features
 
@@ -16,6 +16,7 @@ A Windows-first desktop app that connects to OBS, starts its timer with OBS reco
 - Per-timestamp 720p screenshots
 - Labels, tag library, and tag propagation
 - Replay-buffer logging (passive)
+- Aitum Vertical support: vertical recordings and Backtrack saves drive the timer like main ones
 - Recent projects for one-click switching (🗑 delete, ✎ rename) + 🔍 toolbar filter + contextual empty states
 - Editable timestamp times (HH:MM:SS in the ✎ dialog) + Recycle-Bin deletion + `session.backup.json` backup
 - Markdown project log with media links
@@ -90,7 +91,7 @@ The executable is created at `dist/timestamp_gui_lite.exe`. The spec bundles the
 2. Enter a project name and click **Set project**.
 3. Select a microphone. If **System default** does not work, choose the explicit input device shown with its index/backend.
 4. Change the timestamp hotkey if desired — click it, then press a key or Mouse 4/5 (Esc cancels).
-5. Start recording in OBS — the app connects and follows automatically — or click **▶ Start timer** to run a session without OBS.
+5. Start recording in OBS — the app connects and follows automatically (the main recording and an Aitum Vertical recording both work; overlapping ones share one timer session) — or click **▶ Start timer** to run a session without OBS.
 6. Press the timestamp hotkey or click **New timestamp**, or click **＋ Manual** to create one from a typed time. Each new timestamp also saves a small JPEG snapshot of your main monitor into the project's `Screenshots` folder.
 7. Click a pending timestamp to start microphone recording; a 🎤 level bar beside the status bar shows the input level, and if the mic picks up nothing at all the silent take is discarded and the row becomes recordable again.
 8. Click the active timestamp to stop and save its WAV file.
@@ -102,7 +103,7 @@ The executable is created at `dist/timestamp_gui_lite.exe`. The spec bundles the
 
 Creating new timestamps requires a running timer — either an active OBS recording or the in-app **▶ Start timer** button. When no timer runs, existing timestamps stay fully usable: pending notes can still record audio and saved notes play back; only creating new entries waits for the next timer start.
 
-Replay saves are logged even while the timer is stopped (they attach to the most recent segment), but a project must be selected — without one the save is only announced in the status bar.
+Replay saves are logged even while the timer is stopped (they attach to the most recent segment), but a project must be selected — without one the save is only announced in the status bar. Aitum Vertical's **Backtrack** replay saves are logged the same way (main OBS replay saves and vertical ones both count; a vertical Backtrack entry only appears when its fresh clip can be located).
 
 Tip: click the **project name field** to reopen one of your five most recent projects instantly — each entry shows how many timestamps and recordings the project holds (read live from its log, not the folder path), and a 🗑 button deletes a project by moving its folder to the Recycle Bin after a confirmation while ✎ renames it (folder, markdown, and `session.json` updated). Typing a new name works as usual. If the app connects while OBS is already recording, it detects the active OBS recording and starts the timer after a project is selected; that segment's header falls back to `Recording N` until the recording stops and the real file name becomes known.
 
