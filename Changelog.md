@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.2
 
 - Vertical Backtrack replay entries now locate their clip by the save time embedded in the file name (`Backtrack [DD-MM][HH-MM-SS]` — day-month, local clock), scanning the save folder's subfolders like `Replay Buffer\` where the plugin actually drops clips, instead of relying on top-level file mtime alone. The vertical recording's own file (`[DD-MM][HH-MM-SS]-vertical.mp4`, actively rewritten during recording, so it always had the newest mtime and was repeatedly mis-resolved as the replay) is excluded from both selection paths — by its queried recording path and its `-vertical` name suffix — so a save without a locatable clip degrades to the amber "path unavailable" status instead of a wrong video; only non-recording, unparseable-name files still fall back to the newest-recent-mtime rule.
 
