@@ -19,6 +19,14 @@ Steps exercised:
   7. Replay rows expose audio state (amber no-audio, red recording,
      green with duration, 🎙 quick-take button) and the toolbar
      Missing-audio toggle filters to replays without a saved take.
+  8. Long-list projects open on the newest entries with the bottom row
+     visible (blank-on-open regression), across big→small→big switches;
+     wheel step is widened to 4 px scroll units (~80 px per notch).
+  9. Watch-from-here: the ⏩ button renders disabled without a segment
+     video path and enabled with one; launching without a seek-capable
+     player opens the default app and copies the offset to the clipboard;
+     a configured player builds the seek command; segment video_start
+     offsets shift the seek position.
 """
 
 from __future__ import annotations
@@ -44,6 +52,23 @@ CHECKS: list[tuple[str, bool]] = []
 def check(label: str, condition: bool) -> None:
     CHECKS.append((label, bool(condition)))
     print(f"{'PASS' if condition else 'FAIL'}  {label}")
+
+
+def row_visible_in_view(canvas, row: dict) -> bool:
+    """True when the row's frame is actually inside the canvas viewport.
+
+    ``winfo_ismapped`` cannot be used for this: on Windows the canvas keeps
+    every embedded window mapped regardless of scroll position (one reason
+    long lists are heavy there). ``winfo_rooty`` instead reports the row's
+    nominal screen Y, which falls outside the canvas's screen rect when the
+    row is scrolled out of view.
+    """
+    if canvas is None or row is None:
+        return False
+    top = canvas.winfo_rooty()
+    bottom = top + canvas.winfo_height()
+    row_y = row["frame"].winfo_rooty()
+    return top - 2 <= row_y < bottom
 
 
 def pump(root, seconds: float) -> None:
@@ -390,7 +415,7 @@ def main() -> int:
             check(
                 "pending replay row is amber with a no-audio hint",
                 "no audio" in w_missing["label"].cget("text")
-                and w_missing["dot"].cget("text_color") == Theme.AMBER,
+                and w_missing["dot"].cget("fg") == Theme.AMBER,
             )
             check(
                 "pending replay quick-take button is hidden",
@@ -409,7 +434,7 @@ def main() -> int:
                 check(
                     "recording replay row is red with a recording hint",
                     "recording — click to stop" in w_missing["label"].cget("text")
-                    and w_missing["dot"].cget("text_color") == Theme.RED
+                    and w_missing["dot"].cget("fg") == Theme.RED
                     and w_missing["take_button"].cget("text") == "■ Stop",
                 )
                 # Completing the take: green row with duration + take button.
@@ -420,7 +445,7 @@ def main() -> int:
                     "completed replay row is green with audio duration",
                     done_entry.status == "completed"
                     and "audio" in w_missing["label"].cget("text")
-                    and w_missing["dot"].cget("text_color") == Theme.GREEN
+                    and w_missing["dot"].cget("fg") == Theme.GREEN
                     and w_missing["take_button"].cget("text") == "🎙",
                 )
 
@@ -491,6 +516,251 @@ def main() -> int:
                 app._stop_mic_meter()
                 app.missing_audio_checkbox.deselect()
                 app._missing_audio_only = False
+
+        # ── 9. Long-list open lands on the newest entries ───────────────
+        # Regression for the blank-on-open bug: the forced project-open
+        # scroll raced the scrollregion update (CTkScrollableFrame only
+        # recomputes it from the inner frame's late <Configure> event), so
+        # opening a project with many rows could park the viewport past the
+        # end of the freshly built content — rows stayed invisible until
+        # the user scrolled. The fixed open path settles the layout
+        # synchronously, resyncs the scrollregion from it, and only then
+        # moves, so switching directions (big→small→big) always lands on
+        # the newest entries with rows actually mapped.
+        app.project_name_var.set("Big List")
+        app._set_project()
+        big_entries = []
+        for seg in range(8):  # ~120 rows over 8 recording segments
+            app.session.start_timer()
+            for i in range(15):
+                entry = app.session.create_timestamp(10.0 * (i + 1))
+                app.session.update_entry(entry.id, f"note {seg}-{i}")
+                big_entries.append(entry)
+            app.session.stop_timer()
+        big_entries.append(
+            app.session.create_replay_entry(
+                "X:/reels/Backtrack [02-01][10-00-00].mp4"
+            )
+        )
+        big_entries.append(
+            app.session.create_replay_entry(
+                "X:/reels/Backtrack [02-01][10-05-00].mp4"
+            )
+        )
+        # A fresh session load via _set_project is the real open path.
+        app.project_name_var.set("Big List")
+        app._set_project()
+        pump(root, 1.0)
+        canvas = app._timestamp_list_canvas()
+        check("big list build produced >100 rows", len(app._list_rows) > 100)
+        check(
+            "big list opens scrolled to the bottom",
+            canvas is not None and canvas.yview()[1] > 0.99,
+        )
+        newest_row = app._list_rows.get(big_entries[-1].id)
+        check(
+            "newest big-list row visible without scrolling",
+            row_visible_in_view(canvas, newest_row),
+        )
+        oldest_row = app._list_rows.get(big_entries[0].id)
+        check(
+            "oldest big-list row stays off-view at the bottom",
+            oldest_row is not None and not row_visible_in_view(canvas, oldest_row),
+        )
+
+        # Small project right after the big one: the overshoot direction —
+        # the canvas still carries the previous, taller region when the
+        # forced scroll runs, which used to strand the viewport past the
+        # end of the short content (blank list again).
+        app.project_name_var.set("Small List")
+        app._set_project()
+        small_entries = [
+            app.session.create_timestamp(5.0 + n) for n in range(2)
+        ]
+        app.project_name_var.set("Small List")
+        app._set_project()
+        pump(root, 1.0)
+        check(
+            "small list after big list opens at the bottom",
+            canvas.yview()[1] > 0.99,
+        )
+        small_row = app._list_rows.get(small_entries[-1].id)
+        check(
+            "small list newest row visible without scrolling",
+            row_visible_in_view(canvas, small_row),
+        )
+
+        # And back to the big project — the reverse direction again.
+        app.project_name_var.set("Big List")
+        app._set_project()
+        pump(root, 1.0)
+        check(
+            "big list re-open stays scrolled to the bottom",
+            canvas.yview()[1] > 0.99,
+        )
+        newest_row = app._list_rows.get(big_entries[-1].id)
+        check(
+            "big list newest row visible again without scrolling",
+            row_visible_in_view(canvas, newest_row),
+        )
+
+        # Wheel step: the timestamp list scrolls ~80 px per notch
+        # (CTk multiplies each wheel event's delta/6 units by this many px).
+        check(
+            "wheel step widened to 4 px scroll units",
+            canvas is not None and int(canvas.cget("yscrollincrement")) == 4,
+        )
+
+        # ── 10. Watch-from-here: ⏩ row button + offset launcher ──────
+        app.project_name_var.set("Watch From Here")
+        app._set_project()
+        app.session.start_timer("[21-08][12-00-00]")
+        watch_entry = app.session.create_timestamp(5)
+        watch_video = os.path.join(temp_output, "watch-video.mp4")
+        with open(watch_video, "wb") as handle:
+            handle.write(b"fake")
+        app._schedule_list_refresh()
+        pump(root, 0.4)
+        watch_row = app._list_rows.get(watch_entry.id)
+        check("watch-from-here row rendered", watch_row is not None)
+        if watch_row is not None:
+            check(
+                "⏩ disabled without a segment video path",
+                str(watch_row["footage_button"].cget("state")) == "disabled",
+            )
+            app.session.set_recording_path(
+                app.session.recordings[0].number, watch_video
+            )
+            app._schedule_list_refresh()
+            pump(root, 0.4)
+            check(
+                "⏩ enabled once the segment path is known",
+                str(watch_row["footage_button"].cget("state")) == "normal",
+            )
+
+            # No seek-capable player: default app opens from 0 and the
+            # offset lands on the clipboard.
+            with mock.patch.object(
+                app, "_footage_player", return_value=(None, None)
+            ), mock.patch.object(
+                app, "_open_with_default_app", return_value=True
+            ) as opener:
+                app._open_footage_at(watch_entry.id)
+                pump(root, 0.3)
+                check(
+                    "fallback opens the default app and copies the offset",
+                    opener.called and root.clipboard_get() == "00:00:05",
+                )
+                check(
+                    "fallback status offers the player hint",
+                    "copied" in app.status_label.cget("text"),
+                )
+
+            # A configured player builds (and would run) the seek command.
+            fake_player = os.path.join(temp_output, "footageplayer.exe")
+            with open(fake_player, "w", encoding="utf-8") as handle:
+                handle.write("fake")
+            with mock.patch(
+                "timestamp_gui.subprocess.Popen"
+            ) as popen, mock.patch.object(
+                app,
+                "_footage_player",
+                return_value=(fake_player, ["--start={start}", "{path}"]),
+            ):
+                app._open_footage_at(watch_entry.id)
+                pump(root, 0.3)
+                argv = popen.call_args[0][0] if popen.called else []
+                check(
+                    "player launch builds the seek command",
+                    argv[:2] == [fake_player, "--start=5"],
+                )
+                check(
+                    "player launch status names the offset and player",
+                    "at 00:00:05 (footageplayer)" in app.status_label.cget("text"),
+                )
+
+            # video_start offsets shift the seek position (manual-timer
+            # continuation: the video joined part-way through the segment).
+            app.session.set_recording_video_start(
+                app.session.recordings[0].number, 3.0
+            )
+            with mock.patch(
+                "timestamp_gui.subprocess.Popen"
+            ) as popen, mock.patch.object(
+                app,
+                "_footage_player",
+                return_value=(fake_player, ["--start={start}", "{path}"]),
+            ):
+                app._open_footage_at(watch_entry.id)
+                pump(root, 0.3)
+                argv = popen.call_args[0][0] if popen.called else []
+                check(
+                    "video_start offsets shift the seek position",
+                    argv[:2] == [fake_player, "--start=2"],
+                )
+
+            # Reuse: each ⏩ click replaces the window instead of piling up
+            # players, so only the process this app spawned is closed.
+            class FakePlayerProcess:
+                def __init__(self, exit_code=None):
+                    self.terminated = False
+                    self._exit_code = exit_code
+
+                def poll(self):
+                    return self._exit_code
+
+                def terminate(self):
+                    self.terminated = True
+
+            first_process = FakePlayerProcess()
+            second_process = FakePlayerProcess()
+            with mock.patch(
+                "timestamp_gui.subprocess.Popen"
+            ) as popen, mock.patch.object(
+                app,
+                "_footage_player",
+                return_value=(fake_player, ["--start={start}", "{path}"]),
+            ):
+                popen.side_effect = [first_process, second_process]
+                app._open_footage_at(watch_entry.id)
+                pump(root, 0.2)
+                app._open_footage_at(watch_entry.id)
+                pump(root, 0.2)
+            check(
+                "each ⏩ click launches the player",
+                popen.call_count == 2 and app._footage_process is second_process,
+            )
+            check(
+                "a new ⏩ click closes the previous player window",
+                first_process.terminated,
+            )
+            check(
+                "the newest player window is left running",
+                not second_process.terminated,
+            )
+
+            # A window the user already closed is not terminated a second time.
+            exited_process = FakePlayerProcess(exit_code=0)
+            app._footage_process = exited_process
+            third_process = FakePlayerProcess()
+            with mock.patch(
+                "timestamp_gui.subprocess.Popen"
+            ) as popen, mock.patch.object(
+                app,
+                "_footage_player",
+                return_value=(fake_player, ["--start={start}", "{path}"]),
+            ):
+                popen.return_value = third_process
+                app._open_footage_at(watch_entry.id)
+                pump(root, 0.2)
+            check(
+                "an already-exited player is not terminated again",
+                not exited_process.terminated,
+            )
+            check(
+                "the launch still succeeds after an exited player",
+                app._footage_process is third_process,
+            )
 
         app.on_closing()
         root = None

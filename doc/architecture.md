@@ -25,6 +25,7 @@ Contains GUI-independent functionality:
 
 - `TimestampEntry`: persisted timestamp state (`kind` distinguishes regular timestamps from automatic replay-buffer entries; replay entries carry `replay_file`).
 - `TimestampSession`: project timer, IDs, JSON persistence, Markdown generation, and safe filenames; `rename_tag()`/`remove_tag()` propagate tag-library edits across entries (case-insensitive, bypassing the recording-row edit lock) and persist like any other change.
+- Watch-from-here resolution: `footage_offset_seconds()` (in-video offset with clamping), `detect_footage_players()` (mpv on `PATH`, VLC under `%ProgramFiles%`; injectable probes), `build_footage_command()` (`{start}`/`{path}` template substitution), and `TimestampSession.get_entry_footage()` — the single source of truth both the GUI's ⏩ launcher and the per-entry Markdown `Footage:` line use. `RecordingInfo.video_start_elapsed` (set via `set_recording_video_start()`) records where an OBS video begins when the recording joined an already-running segment timer.
 - `sanitize_recent_projects` / `update_recent_projects` / `remove_recent_project`: pure helpers behind the five-slot recent-projects list stored in `keybinds.json`.
 - `read_project_stats`: reads one project's `session.json` defensively and returns its timestamp/segment counts for the recent-projects popup rows (zeros on missing or corrupt data).
 - `sanitize_tag_definitions` / `normalize_tag_name` / `is_valid_hex_color`: pure helpers validating the `tags` key and normalizing tag names everywhere (config load and the tag manager share them).
@@ -112,6 +113,28 @@ Capture failure only shows an amber status message; the timestamp stays valid an
 
 Each timestamp row carries a 📷 button (`_open_screenshot`) that opens `entry.screenshot_file` (stored relative to the project folder) with the OS default image viewer, mirroring a replay row's 🎬 button. The button renders disabled until the asynchronous capture attaches the JPEG, so in-flight, failed, and pre-screenshot entries stay greyed out; a click on a missing file reports an error in the status bar. Replay rows capture no screenshot and keep no 📷 button.
 
+### Watch-from-here (⏩)
+
+```text
+⏩ click on a timestamp row
+  → TimestampSession.get_entry_footage(entry_id)
+     # (video_path, seconds_into_video) or None; None also for replay-kind entries
+  → file check + player resolution (_footage_player, resolved once and cached):
+      playback_settings.player_path → mpv on PATH → VLC under %ProgramFiles%
+  → found: subprocess.Popen([player, seek-args…]) with seconds rounded to 0.5
+     and the video path normalized to native separators
+  → none found: os.startfile from the start + offset HH:MM:SS on the clipboard
+     + an amber status hint naming playback_settings.player_path
+```
+
+The per-entry `Footage:` line in the Markdown log reuses the same resolution with a `#t=` media fragment instead of a command line. Player seek flags come from the detection result (mpv `--start={start}`, VLC `--no-one-instance --start-time={start}`) or a hand-set `playback_settings.player_args` template; a configured player without a template opens from the start like the fallback. Two details keep the seek working on Windows:
+
+- `build_footage_command` substitutes `{path}` with `normalize_footage_path(path)` — native separators via `os.path.normpath`. OBS reports recording paths with forward slashes (`C:/Videos/clip.mp4`); players parse such an argument as a URI with a bogus one-letter scheme and silently load nothing, so VLC started with an empty playlist while 📼 (ShellExecute, which normalizes the same stored path) worked. Values already carrying a scheme (`file:///…`) pass through untouched.
+- VLC's auto-detected template leads with `--no-one-instance`: with "one instance" mode enabled a new input can be forwarded to the running instance and the start time dropped, degrading the jump to open-at-`0:00`.
+- Because each launch is therefore a fresh instance, `_open_footage_at` keeps the Popen handle in `self._footage_process` and `_close_footage_process()` terminates it before the next launch — at most one ⏩-launched player window exists at a time. Windows the user opened directly are untracked and never closed, and `_on_close` deliberately leaves the player running so a moment being watched outlives the app.
+
+Segments joined mid-recording stay approximate: the app cannot know when OBS's video actually began, and offsets simply clamp at zero. When an OBS recording joins an already-running segment timer, the GUI stores the in-segment elapsed where the video begins (`set_recording_video_start`), keeping those offsets exact. A segment that recorded through both outputs points at the **main** OBS recording: `OBSManager` caches the path each output last reported and `_recompute_recording_activity` prefers the main one, so Aitum Vertical's start-first or stop-last events cannot leave the segment (⏩, 📼, Markdown) pointing at the vertical video nondeterministically. Both caches clear when the combined session ends, so a later vertical-only session reports its own file.
+
 Each recording section header carries a 📼 button (`_open_recording_video`) that opens that segment's main OBS recording video with the OS default player, sharing the same open-with-default-app helper as 🎬 and 📷 (`_open_with_default_app`). The button renders disabled while the segment has no stored video path: segments recorded by older app versions, events without a reported output path, and in-app ▶/■ timer-only segments never get one. A missing file reports an error in the status bar; nothing is ever deleted.
 
 ### OBS stop
@@ -146,7 +169,7 @@ Without a selected project the save is announced but not logged. Replay rows reu
 Each project folder contains:
 
 - `<Project Name>.md`: readable log with one section per recording segment, a `Footage:` link under each segment header whose video path is known, relative links to completed WAV files, and an embedded screenshot line under each captured timestamp (an Obsidian wikilink embed using the bare filename: `![[R##-###_HH-MM-SS.jpg]]`).
-- `session.json`: project name, timer metadata, recording segments (including their OBS video paths), timestamp states, file paths, durations, and relative screenshot filenames.
+- `session.json`: project name, timer metadata, recording segments (including their OBS video paths and the optional `video_start_elapsed` where a video joined an already-running segment timer), timestamp states, file paths, durations, and relative screenshot filenames.
 - `R##-###_HH-MM-SS.wav`: microphone recordings, named after their segment and per-segment index.
 - `Screenshots/R##-###_HH-MM-SS.jpg`: per-timestamp main-monitor snapshots (720p-height JPEG).
 

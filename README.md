@@ -9,6 +9,7 @@ A Windows-first desktop app that connects to OBS, starts its timer with OBS reco
 - OBS WebSocket auto-connect with recording sync + ⚙ in-app connection editor (host/port/password)
 - ▶/■ Built-in timer (works without OBS) + ⏸ Pause for manual sessions (same-segment resume)
 - Clickable timestamp workflow: pending → recording → playback
+- ⏩ Watch-from-here: open a timestamp's OBS footage at that moment — auto-detects mpv/VLC (or set one in `keybinds.json`); without one, the default player opens while the offset is copied to the clipboard
 - Per-recording segment groups with restarting numbering
 - 📼 button per segment to open its main OBS recording
 - Microphone WAV recording and playback, with re-recordable takes per timestamp
@@ -48,6 +49,7 @@ Completed recordings are linked from the Markdown file, which groups timestamps 
 
 - 001 [00:12:34](R01-001_00-12-34_2.wav) — completed, 3.8s — "Good take" #kill #bug
   - ![[R01-001_00-12-34.jpg]]
+  - Footage: [[21-08][14-55-19].mp4](file:///E:/Videos/%5B21-08%5D%5B14-55-19%5D.mp4#t=754)
   - Take 1: [R01-001_00-12-34.wav](R01-001_00-12-34.wav) (4.2s)
 - 002 00:18:05 — pending
   - ![[R01-002_00-18-05.jpg]]
@@ -99,7 +101,8 @@ The executable is created at `dist/timestamp_gui_lite.exe`. The spec bundles the
 10. Use **✎** to add a label, tags, and correct the time (HH:MM:SS) for any timestamp — its **Audio takes** section also lets you re-record a new take, audition old ones, switch the active take (**★ Use**), or delete individual takes. **✕** deletes the whole entry (all takes plus the screenshot are moved to the Recycle Bin; locked files keep the entry so you can retry).
 11. Save a replay buffer in OBS (default hotkey) while connected: it is logged automatically as a 🎬 REPLAY entry at the current time. Click it to record a microphone note exactly like a timestamp, use **🎬** on the row to watch the replay video, and **✎**/**✕** to tag or remove it.
 12. Use the **📼** button next to a recording's section header to watch that segment's full OBS video; segments recorded without OBS stay greyed out.
-13. Filter with 🔍 above the list (label, tag, ref, or time substring) and edit times directly in the ✎ dialog; recent projects can be renamed via ✎ in the popup (beside 🗑). While the manual ▶ timer runs, ⏸ Pause freezes the clock and timestamp times for the same segment until ▶ Resume (disabled while OBS records). Each `session.json` save also keeps a one-generation `session.backup.json`.
+13. Press **⏩** on a timestamp row to open its segment video **at that moment's offset** (mpv/VLC are found automatically, or set `playback_settings.player_path` in `keybinds.json`; with no seek-capable player the default player opens from the start and the offset time is copied to the clipboard). The Markdown log links each timestamp's moment with the same offset (`#t=` fragment).
+14. Filter with 🔍 above the list (label, tag, ref, or time substring) and edit times directly in the ✎ dialog; recent projects can be renamed via ✎ in the popup (beside 🗑). While the manual ▶ timer runs, ⏸ Pause freezes the clock and timestamp times for the same segment until ▶ Resume (disabled while OBS records). Each `session.json` save also keeps a one-generation `session.backup.json`.
 
 Creating new timestamps requires a running timer — either an active OBS recording or the in-app **▶ Start timer** button. When no timer runs, existing timestamps stay fully usable: pending notes can still record audio and saved notes play back; only creating new entries waits for the next timer start.
 

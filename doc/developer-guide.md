@@ -44,7 +44,8 @@ The spec creates `dist/timestamp_gui_lite.exe` and bundles CustomTkinter, OBS We
 - Keep OBS protocol behavior in `timestamp_obs.py`; do not import Tkinter there.
 - Route OBS and pynput callbacks into Tk with `root.after(0, ...)`.
 - Update `session.json` and regenerate the Markdown log whenever persisted timestamp state changes. `session.json` writes are always synchronous; the Markdown regeneration may be debounced by the GUI (`TimestampSession.markdown_autoflush = False` + `flush_markdown()`, default `True` keeps everything synchronous for tests and direct consumers).
-- Keep the timestamp list refresh cheap: rows are cached and carry change signatures — never reconfigure a row whose entry did not change, and never call `update_idletasks()` on refresh paths.
+- Keep the timestamp list refresh cheap: rows are cached and carry change signatures — never reconfigure a row whose entry did not change, and never call `update_idletasks()` on refresh paths. The one sanctioned exception is the forced project-open scroll (`_scroll_timestamp_list_to_bottom(force=True)`): opening a project rebuilds hundreds of rows whose layout settles in waves, and the one synchronous layout pass there re-derives the scrollregion (`bbox("all")`) before the scroll so the viewport cannot land past the content end.
+- Timestamp-list rows, headers, footers, and chips are deliberately plain tk widgets (the dark theme is locked, so hard-coded colors are safe); do not "restore" CTk rows and remember tk `width`/`height` are font-dependent units, not pixels — size icon buttons via `padx`/`pady`.
 - Add tests for filename, persistence, or state changes before changing the data model.
 - Update the relevant `doc/` page and README when behavior changes.
 - Do not reintroduce removed integrations without an explicit product decision.

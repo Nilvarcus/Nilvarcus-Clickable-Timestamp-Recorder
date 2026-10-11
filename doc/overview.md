@@ -21,6 +21,7 @@ Clickable Timestamp Recorder helps creators attach short microphone notes to exa
 - Built-in ▶/■ timer: full timestamp sessions without OBS open.
 - Recent-projects popup: the five most recently opened projects load with one click from the project-name field; rows show each project's timestamp/recording counts, and a 🗑 button deletes projects (folder to Recycle Bin) plus an ✎ button renames them (folder, markdown, and session metadata) from the same popup.
 - Per-timestamp context screenshots: a 720p-height main-monitor JPEG saved into `Screenshots/` and embedded in the Markdown log.
+- Watch-from-here (⏩): timestamp rows open their segment video at the entry's offset (auto-detected mpv/VLC or a configured player; default-player fallback copies the offset to the clipboard), and the Markdown log links each moment with a `#t=` fragment.
 - In-app OBS connection editor (⚙ header button for host/port/password/auto-connect) with visible auth-failure surfacing.
 - Toolbar search/filter (🔍) over labels, tags, refs, and times; contextual empty states; and time-editable timestamps (HH:MM:SS field in the ✎ dialog, same-segment).
 - Manual-timer pause (⏸/▶, frozen clock, same-segment resume, OBS-driven sessions disable it).

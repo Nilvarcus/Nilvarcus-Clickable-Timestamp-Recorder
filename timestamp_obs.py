@@ -224,6 +224,12 @@ class OBSManager:
         self._connected = False
         self._recording_active = False
         self._vertical_recording_active = False
+        # Video path each output last reported. The segment prefers the main
+        # recording's path: Aitum Vertical's events can arrive first at start
+        # (vertical-only start) or last at stop, which otherwise left a mixed
+        # segment pointing at the vertical file nondeterministically.
+        self._main_record_path: str | None = None
+        self._vertical_record_file: str | None = None
         # Merged view used for started/stopped transitions; reset by teardown
         # so a reconnect mid-recording re-fires started.
         self._combined_recording_active = False
@@ -402,6 +408,8 @@ class OBSManager:
             self._vertical_recording_active = False
             self._combined_recording_active = False
             self._replay_buffer_active = None
+            self._main_record_path = None
+            self._vertical_record_file = None
 
     def _start_attempt(self, source: str) -> None:
         """Spawn one connection attempt unless another one is still running."""
@@ -498,6 +506,8 @@ class OBSManager:
                 self._vertical_recording_active = False
                 self._combined_recording_active = False
                 self._replay_buffer_active = None
+                self._main_record_path = None
+                self._vertical_record_file = None
             if self._is_auth_failure(exc):
                 # Wrong password / auth failures must surface even from the
                 # watchdog — "Waiting for OBS…" hides the real problem.
@@ -527,15 +537,24 @@ class OBSManager:
         print(f"[OBS] Record state: {state}")
 
         if state == "OBS_WEBSOCKET_OUTPUT_STARTED":
+            self._remember_main_path(output_path)
             if not self._recording_active:
                 self._recording_active = True
-                self._recompute_recording_activity(output_path)
+                self._recompute_recording_activity()
         elif state == "OBS_WEBSOCKET_OUTPUT_STOPPED":
             # Wait for STOPPED rather than STOPPING so the final file path is
-            # available for renaming the segment that was just recorded.
+            # available for renaming the segment that was just recorded. A
+            # duplicate stop event is ignored rather than cached: a stale path
+            # must never name a later recording session.
             if self._recording_active:
+                self._remember_main_path(output_path)
                 self._recording_active = False
-                self._recompute_recording_activity(output_path)
+                self._recompute_recording_activity()
+
+    def _remember_main_path(self, output_path) -> None:
+        """Cache the main recording's file path when OBS reported one."""
+        if output_path:
+            self._main_record_path = str(output_path)
 
     def on_vendor_event(self, data) -> None:
         """Handle obs-websocket vendor events (plugin-defined events).
@@ -563,33 +582,60 @@ class OBSManager:
                 already = self._vertical_recording_active
                 self._vertical_recording_active = True
             if not already:
-                self._recompute_recording_activity(self._vertical_record_path())
+                # Resolve the path outside the lock (the query takes it too) so
+                # a vertical-first start can still name the segment; duplicate
+                # events stay query-free.
+                self._remember_vertical_path(self._vertical_record_path())
+                self._recompute_recording_activity()
         elif event_type == "recording_stopped":
             # Resolve the file path before clearing the state: the output's
             # settings keep the last recording path, so the stop event can
-            # backfill the segment name even if start resolution failed.
+            # backfill the segment name even if start resolution failed. A
+            # duplicate stop event is ignored rather than cached, so it cannot
+            # name a later recording session.
             path = self._vertical_record_path()
             with self._lock:
                 already = not self._vertical_recording_active
                 self._vertical_recording_active = False
             if not already:
-                self._recompute_recording_activity(path)
+                self._remember_vertical_path(path)
+                self._recompute_recording_activity()
         elif event_type == "backtrack_saved":
             self._fire(self._on_replay_saved, self._vertical_backtrack_path())
 
-    def _recompute_recording_activity(self, path=None) -> None:
+    def _remember_vertical_path(self, path) -> None:
+        """Cache the Aitum Vertical recording's file path when resolved."""
+        if path:
+            self._vertical_record_file = str(path)
+
+    def _record_path(self) -> str | None:
+        """Best known recording file path: main output first, then vertical."""
+        return self._main_record_path or self._vertical_record_file
+
+    def _recompute_recording_activity(self) -> None:
         """Fire started/stopped callbacks on transitions of the combined state.
 
         Main and Aitum Vertical recordings are independent outputs; the timer
         sees one merged session that runs while either is active, so starting
         one while the other already records does not restart the timer.
+
+        The callbacks always carry the best known recording file: the main
+        recording's path when OBS reported one, otherwise Aitum Vertical's.
+        Preferring the main path keeps a mixed segment deterministic — the
+        vertical plugin's events can arrive first at start or last at stop and
+        otherwise leave the segment pointing at the vertical video.
         """
         combined = self._recording_active or self._vertical_recording_active
         if combined and not self._combined_recording_active:
             self._combined_recording_active = True
-            self._fire(self._on_recording_started, path)
+            self._fire(self._on_recording_started, self._record_path())
         elif not combined and self._combined_recording_active:
             self._combined_recording_active = False
+            path = self._record_path()
+            # A finished session must not leak its path into the next one: a
+            # later vertical-only session has to report its own file.
+            self._main_record_path = None
+            self._vertical_record_file = None
             self._fire(self._on_recording_stopped, path)
 
     def _query_vertical_recording(self, req):

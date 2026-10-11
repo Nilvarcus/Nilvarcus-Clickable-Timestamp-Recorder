@@ -30,12 +30,15 @@ from timestamp_audio import (
     TAG_NAME_MAX_LENGTH,
     TimestampEntry,
     TimestampSession,
+    build_footage_command,
+    detect_footage_players,
     format_elapsed_display,
     normalize_tag_name,
     parse_time_input,
     read_project_stats,
     remove_recent_project,
     replay_display_name,
+    sanitize_playback_settings,
     sanitize_project_name,
     sanitize_recent_projects,
     sanitize_tag_definitions,
@@ -139,6 +142,12 @@ FOLDER_LABEL_MAX_CHARS = 40
 ROW_TAG_CHIPS = 3
 ROW_LABEL_MAX_CHARS = 34
 
+# Mouse-wheel scroll granularity for the timestamp list, in pixels per
+# yscrollincrement unit. CTk's Windows wheel handler scrolls int(delta/6)
+# units per event (a ±120 notch → 20 units), so the pixel step is this
+# constant × 20: 4 → ~80 px ≈ 2.5 rows per notch instead of CTk's 1 px.
+WHEEL_STEP_PX = 4
+
 # Recent-projects rows show "<name> · N timestamps · M recordings"; long
 # names get middle-elided so the counts stay visible.
 RECENT_ROW_NAME_MAX_CHARS = 36
@@ -167,6 +176,18 @@ class TimestampApp:
             "obs_settings",
             {"host": "localhost", "port": 4455, "password": ""},
         )
+        # Watch-from-here: player for opening footage at a timestamp's
+        # offset. Resolved lazily on first use and cached (see
+        # _footage_player); sanitize_playback_settings degrades every
+        # malformed stored value to auto-detect.
+        self.playback_settings = sanitize_playback_settings(
+            self.config.get("playback_settings")
+        )
+        self._footage_player_cache: tuple[str | None, list[str] | None] | None = None
+        # The player process this app spawned for watch-from-here, so the next
+        # ⏩ click can close it instead of piling up windows. Only processes
+        # launched here are tracked — players the user opened are never touched.
+        self._footage_process = None
         self.timestamp_key = (
             self.config.get("keybinds", {}).get("mark_time") or "f15"
         )
@@ -236,7 +257,7 @@ class TimestampApp:
         # interaction).
         self._list_rows: dict[int, dict] = {}
         self._header_widgets: dict[object, dict] = {}
-        self._footer_labels: dict[object, ctk.CTkLabel] = {}
+        self._footer_labels: dict[object, dict] = {}
         self._empty_label: ctk.CTkLabel | None = None
         self._list_rows_session: TimestampSession | None = None
         self._list_refresh_job: str | None = None
@@ -283,6 +304,7 @@ class TimestampApp:
                 "silence_threshold": self.recorder.silence_threshold,
                 "silence_timeout": self.recorder.silence_timeout,
             },
+            "playback_settings": self.playback_settings,
             "audio_device": self._selected_device_index(),
             "tags": self.tag_definitions,
             "recent_projects": self.recent_projects,
@@ -641,6 +663,17 @@ class TimestampApp:
         )
         self.timestamp_list.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
         self.timestamp_list.grid_columnconfigure(0, weight=1)
+        # Wider wheel step: CTk scrolls delta/6 "units" of yscrollincrement
+        # px per wheel event, and its Windows default increments 1 px — about
+        # 20 px (a fraction of a row) per notch, which makes long lists crawl.
+        # 4 px units → ~80 px ≈ 2.5 rows per notch (trackpad deltas stay
+        # smooth: tiny deltas already round to whole units either way).
+        canvas = self._timestamp_list_canvas()
+        if canvas is not None:
+            try:
+                canvas.configure(yscrollincrement=WHEEL_STEP_PX)
+            except tk.TclError:
+                pass
 
     def _create_footer(self) -> None:
         footer = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -1851,6 +1884,115 @@ class TimestampApp:
             return
         self._set_status(f"Opened recording {os.path.basename(path)}.", Theme.BLUE)
 
+    def _footage_player(self) -> tuple[str | None, list[str] | None]:
+        """Resolve the seek-capable player for watch-from-here, once.
+
+        Order: an explicit ``playback_settings.player_path`` from
+        keybinds.json (optionally paired with a ``player_args`` template),
+        then mpv on PATH, then VLC under %ProgramFiles%. ``(None, None)``
+        means no seek-capable player exists — the caller falls back to the
+        default player plus a clipboard offset. The result is cached: probing
+        is cheap, but one resolution per app run keeps behavior stable.
+        """
+        if self._footage_player_cache is not None:
+            return self._footage_player_cache
+        explicit = str(self.playback_settings.get("player_path") or "").strip()
+        template = self.playback_settings.get("player_args")
+        if explicit:
+            resolved: tuple[str | None, list[str] | None] = (
+                explicit,
+                list(template) if template else None,
+            )
+        else:
+            resolved = detect_footage_players()
+        self._footage_player_cache = resolved
+        return resolved
+
+    def _close_footage_process(self) -> None:
+        """Close the player window this app spawned, if it is still running.
+
+        Watch-from-here launches a fresh player instance per click (one-instance
+        forwarding would drop ``--start-time``), so without this each timestamp
+        would leave another window behind. Only the tracked process is touched:
+        player windows the user opened directly have no handle here and are
+        never closed. A process that already exited is skipped, and any error
+        (the player dying concurrently, a handle without ``terminate``) is
+        swallowed so a close can never block opening the next moment.
+        """
+        process = self._footage_process
+        self._footage_process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+
+    def _open_footage_at(self, entry_id: int) -> None:
+        """Open the entry's segment video AT the entry's offset (⏩).
+
+        Uses the resolved footage player (see _footage_player); with no
+        seek-capable player installed, opens the video in the default player
+        from the start while the offset time is copied to the clipboard so it
+        can be pasted into the player's seek field. Mirrors
+        _open_recording_video's file-existence and status handling.
+
+        At most one ⏩-launched player window exists at a time: the previously
+        launched process is closed before the new one starts. Applies to VLC,
+        mpv, and a hand-configured player alike.
+        """
+        if not self.session or not self.session.get(entry_id):
+            return
+        footage = self.session.get_entry_footage(entry_id)
+        if not footage:
+            return
+        path, seconds = footage
+        if not os.path.isfile(path):
+            self._set_status(f"Recording video not found: {path}", Theme.RED)
+            return
+        player, player_args = self._footage_player()
+        if player:
+            try:
+                argv = build_footage_command(player, player_args, path, seconds)
+            except ValueError as exc:
+                self._set_status(str(exc), Theme.RED)
+                return
+            # Close the previous window first: each launch is a fresh instance
+            # (VLC's one-instance mode drops the seek), so reuse comes from
+            # replacing the window rather than handing the file to it.
+            self._close_footage_process()
+            try:
+                self._footage_process = subprocess.Popen(argv)
+            except Exception as exc:
+                self._footage_process = None
+                self._set_status(f"Could not open footage: {exc}", Theme.RED)
+                return
+            player_name = (
+                os.path.splitext(os.path.basename(player))[0] or "player"
+            )
+            self._set_status(
+                f"Opened {os.path.basename(path)} at "
+                f"{format_elapsed_display(seconds)} ({player_name}).",
+                Theme.BLUE,
+            )
+            return
+        # No seek-capable player found: today's default-player behavior, plus
+        # the offset on the clipboard so it is never lost.
+        if not self._open_with_default_app(path, "recording"):
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(format_elapsed_display(seconds))
+        except tk.TclError:
+            pass
+        self._set_status(
+            f"Opened {os.path.basename(path)} from the start. Offset "
+            f"{format_elapsed_display(seconds)} copied — set playback_settings.player_path"
+            " to mpv or VLC to jump on open.",
+            Theme.AMBER,
+        )
+
     def _open_replay_video(self, entry_id: int) -> None:
         """Open the OBS replay video of an entry in the default player."""
         if not self.session:
@@ -2065,18 +2207,41 @@ class TimestampApp:
         except tk.TclError:
             return True
 
-    def _scroll_timestamp_list_to_bottom(self) -> None:
+    def _scroll_timestamp_list_to_bottom(self, force: bool = False) -> None:
         """Scroll the timestamp list to its newest entry once layout settles.
 
-        No ``update_idletasks()`` here: forcing a full layout pass over every
-        widget made adding a row to a long list feel heavy. Tk runs the
-        geometry idle handlers (registered by the fresh ``grid()`` calls)
-        before this ``after_idle`` callback, so the scrollregion is already
-        up to date; a second chained idle pass retries in case layout
-        landed later than expected.
+        ``force=True`` marks the project-open path (the only setter of
+        ``_scroll_to_bottom_on_next_refresh``), where hundreds of fresh rows
+        settle in several layout waves. ``CTkScrollableFrame`` recomputes its
+        canvas ``scrollregion`` only from the inner frame's ``<Configure>``
+        window event, which is delivered *after* the idle callbacks that do
+        the actual layout — so an ``after_idle`` moveto(1.0) can compute
+        against a stale region and park the viewport past the end of the
+        (new, taller or shorter) content, leaving the list looking blank
+        until a manual scroll recomputes against the settled region.
+        Therefore the forced path first runs ``update_idletasks()`` once and
+        resyncs the scrollregion from the laid-out geometry before moving:
+        one synchronous full layout pass per project open is cheap and rare,
+        unlike the per-row refresh paths where it stays forbidden.
+
+        With ``force=False`` (single new rows) no ``update_idletasks()``:
+        TK runs the geometry idle handlers (registered by the fresh
+        ``grid()`` calls) before the ``after_idle`` callback, so the
+        scrollregion is nearly up to date; the second chained idle pass
+        retries in case layout landed later than expected.
         """
         if self._closing:
             return
+
+        if force:
+            canvas = self._timestamp_list_canvas()
+            if canvas is not None:
+                try:
+                    self.timestamp_list.update_idletasks()
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+                    canvas.yview_moveto(1.0)
+                except tk.TclError:
+                    pass
 
         def _scroll() -> None:
             canvas = self._timestamp_list_canvas()
@@ -2232,12 +2397,16 @@ class TimestampApp:
         seen_rows: set[int] = set()
         seen_headers: set[object] = set()
         # Playing state is the same comparison for every row: resolve the
-        # playback path once instead of calling os.path.abspath per row.
+        # playback path once instead of calling os.path.abspath per row, and
+        # map segment numbers to their OBS video paths for the ⏩ states.
         playback_key = (
             os.path.abspath(self.playback.current_path)
             if self.playback.current_path
             else None
         )
+        footage_paths = {
+            recording.number: recording.path for recording in session.recordings
+        }
         for grid_row, item in enumerate(items):
             if item[0] == "header":
                 _, key, title, live, count, recording = item
@@ -2253,7 +2422,7 @@ class TimestampApp:
                 )
                 if widgets["rendered"] != rendered:
                     widgets["label"].configure(
-                        text=rendered[0], text_color=rendered[1]
+                        text=rendered[0], fg=rendered[1]
                     )
                     widgets["rendered"] = rendered
                 open_button = widgets["open_button"]
@@ -2275,10 +2444,13 @@ class TimestampApp:
                 footer = self._footer_labels.get(key)
                 if footer is None:
                     footer = {
-                        "label": ctk.CTkLabel(
+                        "label": tk.Label(
                             self.timestamp_list,
                             font=Theme.FONT_SMALL,
                             anchor="w",
+                            bg=Theme.BG_ENTRY,
+                            fg=Theme.TEXT_DIM,
+                            takefocus=0,
                         ),
                         "rendered": None,
                         "grid_row": None,
@@ -2294,7 +2466,7 @@ class TimestampApp:
                 )
                 label = footer["label"]
                 if footer["rendered"] != text:
-                    label.configure(text=text, text_color=Theme.TEXT_DIM)
+                    label.configure(text=text, fg=Theme.TEXT_DIM)
                     footer["rendered"] = text
                 if footer["grid_row"] != grid_row:
                     label.grid(row=grid_row, column=0, padx=26, pady=(0, 6), sticky="w")
@@ -2307,7 +2479,7 @@ class TimestampApp:
                     widgets = self._create_row_widgets(entry)
                     self._list_rows[entry_id] = widgets
                     added_row = True
-                self._update_row_widgets(widgets, entry, playback_key)
+                self._update_row_widgets(widgets, entry, playback_key, footage_paths)
                 if widgets["grid_row"] != grid_row:
                     widgets["frame"].grid(
                         row=grid_row, column=0, padx=2, pady=1, sticky="ew"
@@ -2335,7 +2507,9 @@ class TimestampApp:
             self._footer_labels.pop(key)["label"].destroy()
 
         if added_row and follow:
-            self._scroll_timestamp_list_to_bottom()
+            # force only on the project-open path, where the layout must be
+            # settled synchronously before measuring the scroll region.
+            self._scroll_timestamp_list_to_bottom(force=force_scroll)
 
     def _drop_all_rows_and_headers(self) -> None:
         """Destroy every cached row/header/footer widget (not the empty label)."""
@@ -2349,63 +2523,126 @@ class TimestampApp:
             footer["label"].destroy()
         self._footer_labels.clear()
 
+    @staticmethod
+    def _flat_icon_button(
+        master,
+        glyph: str,
+        hover_color: str,
+        command,
+        state: str = "normal",
+    ) -> tk.Button:
+        """Flat one-window stand-in for a small list icon button.
+
+        List rows deliberately avoid CTk widgets: every CTk widget is a Frame
+        plus an internal Canvas (two OS windows with rounded-rect GDI drawing
+        that repaints on hover), which makes long lists heavy on Windows. A
+        flat tk.Button is a single window with no canvas. Hover shows via
+        ``activebackground``, disabled controls dim via ``disabledforeground``
+        and, like CTk's canvas buttons, never take keyboard focus. The dark
+        palette is static (the app locks Dark mode), so hard-coded colors are
+        safe. Square corners are the accepted visual trade-off.
+
+        Size comes from the glyph plus small padx/pady instead of explicit
+        width/height: those tk options are font-dependent (average character
+        widths / text lines), not CTk-style pixels, and inflate the buttons
+        to hundreds of px per row.
+        """
+        return tk.Button(
+            master,
+            text=glyph,
+            font=Theme.FONT_SMALL,
+            padx=3,
+            pady=1,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            bg=Theme.BTN_SURFACE,
+            fg=Theme.TEXT_BRIGHT,
+            activebackground=hover_color,
+            activeforeground=Theme.TEXT_BRIGHT,
+            disabledforeground=Theme.TEXT_DIM,
+            cursor="hand2",
+            state=state,
+            command=command,
+            takefocus=0,
+        )
+
     def _create_row_widgets(self, entry: TimestampEntry) -> dict:
         """Build the widget tree for one compact timestamp row (once per entry).
 
         One thin line: status dot · ref+time+state text · label/tag chips ·
-        mini action icons (📷 and 🎙 on timestamps, 🎬 and 🎙 on replays, ✎, ✕). The whole row — frame and
+        mini action icons (⏩ 📷 and 🎙 on timestamps, 🎬 and 🎙 on replays,
+        ✎, ✕). The whole row — frame and
         every passive child including chips — forwards clicks to the same
         record/stop/play state machine the old full-width button used; only
         the icon buttons are separate click targets. Everything state-
         dependent is applied by ``_update_row_widgets``.
+
+        All widgets are plain tk widgets (see ``_flat_icon_button`` for why);
+        the shared background is the list's BG_ENTRY because the old CTk
+        containers were transparent against exactly that color.
         """
         assert self.session is not None
         entry_id = entry.id
-        row_frame = ctk.CTkFrame(
-            self.timestamp_list, fg_color="transparent", corner_radius=6
+        row_frame = tk.Frame(
+            self.timestamp_list,
+            bg=Theme.BG_ENTRY,
+            bd=0,
+            highlightthickness=0,
         )
         row_frame.grid_columnconfigure(2, weight=1)
 
-        dot = ctk.CTkLabel(
-            row_frame, text="●", width=16, font=Theme.FONT_SMALL, anchor="e"
+        dot = tk.Label(
+            row_frame,
+            text="●",
+            font=Theme.FONT_SMALL,
+            anchor="e",
+            bg=Theme.BG_ENTRY,
+            fg=Theme.TEXT_DIM,
+            takefocus=0,
         )
         dot.grid(row=0, column=0, padx=(8, 3), pady=4, sticky="ns")
 
-        main_label = ctk.CTkLabel(row_frame, text="", font=Theme.FONT_ROW, anchor="w")
+        main_label = tk.Label(
+            row_frame,
+            text="",
+            font=Theme.FONT_ROW,
+            anchor="w",
+            bg=Theme.BG_ENTRY,
+            fg=Theme.TEXT_DIM,
+            takefocus=0,
+        )
         main_label.grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
 
-        meta_frame = ctk.CTkFrame(row_frame, fg_color="transparent", height=0)
+        meta_frame = tk.Frame(
+            row_frame, bg=Theme.BG_ENTRY, bd=0, highlightthickness=0, height=0
+        )
         meta_frame.grid(row=0, column=2, padx=0, pady=4, sticky="ew")
 
-        actions = ctk.CTkFrame(row_frame, fg_color="transparent")
+        actions = tk.Frame(
+            row_frame, bg=Theme.BG_ENTRY, bd=0, highlightthickness=0
+        )
         actions.grid(row=0, column=3, padx=(2, 6), pady=3, sticky="e")
         next_action_column = 0
         shot_button = None
         take_button = None
+        footage_button = None
         if entry.kind == "replay" and entry.replay_file:
-            ctk.CTkButton(
+            self._flat_icon_button(
                 actions,
-                text="🎬",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.VIOLET_HOVER,
-                command=lambda entry_id=entry_id: self._open_replay_video(entry_id),
+                "🎬",
+                Theme.VIOLET_HOVER,
+                lambda entry_id=entry_id: self._open_replay_video(entry_id),
             ).grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
             # Replays get the same quick-take control as timestamps so a
             # clip can be (re-)recorded without opening the edit dialog.
             # Visibility and look are driven by _update_row_widgets.
-            take_button = ctk.CTkButton(
+            take_button = self._flat_icon_button(
                 actions,
-                text="🎙",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.BTN_SURFACE_HOVER,
-                command=lambda entry_id=entry_id: self._quick_take(entry_id),
+                "🎙",
+                Theme.BTN_SURFACE_HOVER,
+                lambda entry_id=entry_id: self._quick_take(entry_id),
             )
             take_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
@@ -2413,53 +2650,50 @@ class TimestampApp:
             # Timestamps get a 📷 opener for their context screenshot. The
             # JPEG attaches asynchronously, so the button starts disabled and
             # is enabled by _update_row_widgets once screenshot_file lands.
-            shot_button = ctk.CTkButton(
+            shot_button = self._flat_icon_button(
                 actions,
-                text="📷",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.BLUE_HOVER,
-                command=lambda entry_id=entry_id: self._open_screenshot(entry_id),
+                "📷",
+                Theme.BLUE_HOVER,
+                lambda entry_id=entry_id: self._open_screenshot(entry_id),
                 state="normal" if entry.screenshot_file else "disabled",
             )
             shot_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
+            # ⏩ Watch-from-here: opens the segment video AT this entry's
+            # offset. Starts disabled; _update_row_widgets enables it for
+            # entries whose segment has a known OBS video path (watching the
+            # moment is valid in every clickable state).
+            footage_button = self._flat_icon_button(
+                actions,
+                "⏩",
+                Theme.GREEN_HOVER,
+                lambda entry_id=entry_id: self._open_footage_at(entry_id),
+                state="disabled",
+            )
+            footage_button.grid(row=0, column=next_action_column, padx=(0, 2))
+            next_action_column += 1
             # Quick "record another take" for completed entries. Visibility
             # and look are driven by _update_row_widgets: hidden while
             # pending/error, ■ Stop while this row captures.
-            take_button = ctk.CTkButton(
+            take_button = self._flat_icon_button(
                 actions,
-                text="🎙",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.BTN_SURFACE_HOVER,
-                command=lambda entry_id=entry_id: self._quick_take(entry_id),
+                "🎙",
+                Theme.BTN_SURFACE_HOVER,
+                lambda entry_id=entry_id: self._quick_take(entry_id),
             )
             take_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
-        ctk.CTkButton(
+        self._flat_icon_button(
             actions,
-            text="✎",
-            width=26,
-            height=22,
-            font=Theme.FONT_SMALL,
-            fg_color=Theme.BTN_SURFACE,
-            hover_color=Theme.BTN_SURFACE_HOVER,
-            command=lambda entry_id=entry_id: self._open_edit_dialog(entry_id),
+            "✎",
+            Theme.BTN_SURFACE_HOVER,
+            lambda entry_id=entry_id: self._open_edit_dialog(entry_id),
         ).grid(row=0, column=next_action_column, padx=(0, 2))
-        ctk.CTkButton(
+        self._flat_icon_button(
             actions,
-            text="✕",
-            width=26,
-            height=22,
-            font=Theme.FONT_SMALL,
-            fg_color=Theme.BTN_SURFACE,
-            hover_color=Theme.RED_HOVER,
-            command=lambda entry_id=entry_id: self._delete_timestamp(entry_id),
+            "✕",
+            Theme.RED_HOVER,
+            lambda entry_id=entry_id: self._delete_timestamp(entry_id),
         ).grid(row=0, column=next_action_column + 1)
 
         # Whole-row click target: forward clicks on passive children too.
@@ -2478,6 +2712,8 @@ class TimestampApp:
             "grid_row": None,
             "shot_button": shot_button,
             "take_button": take_button,
+            "footage_button": footage_button,
+            "footage_state": None,
         }
 
     def _create_header_widgets(self, recording: RecordingInfo | None) -> dict:
@@ -2487,24 +2723,28 @@ class TimestampApp:
         OBS recording video; it starts disabled and stays greyed until the
         session knows the file path (segments from the in-app timer toggle
         or older sessions never get one). The "Earlier timestamps" header
-        passes ``None`` and renders label-only.
+        passes ``None`` and renders label-only. Plain tk widgets, like rows
+        (see ``_flat_icon_button``).
         """
-        frame = ctk.CTkFrame(self.timestamp_list, fg_color="transparent")
-        label = ctk.CTkLabel(frame, font=Theme.FONT_SMALL, anchor="w")
+        frame = tk.Frame(
+            self.timestamp_list, bg=Theme.BG_ENTRY, bd=0, highlightthickness=0
+        )
+        label = tk.Label(
+            frame,
+            font=Theme.FONT_SMALL,
+            anchor="w",
+            bg=Theme.BG_ENTRY,
+            fg=Theme.TEXT_DIM,
+            takefocus=0,
+        )
         label.grid(row=0, column=0, padx=12, pady=(8, 1), sticky="w")
         open_button = None
         if recording is not None:
-            open_button = ctk.CTkButton(
+            open_button = self._flat_icon_button(
                 frame,
-                text="📼",
-                width=26,
-                height=20,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.GREEN_HOVER,
-                command=lambda number=recording.number: self._open_recording_video(
-                    number
-                ),
+                "📼",
+                Theme.GREEN_HOVER,
+                lambda number=recording.number: self._open_recording_video(number),
                 state="normal" if recording.path else "disabled",
             )
             open_button.grid(row=0, column=1, padx=(6, 0), pady=(8, 1), sticky="w")
@@ -2522,14 +2762,16 @@ class TimestampApp:
         widgets: dict,
         entry: TimestampEntry,
         playback_key: str | None,
+        footage_paths: dict[int, str | None] | None = None,
     ) -> None:
         """Reconfigure a cached row in place to match the entry's current state.
 
         A full-signature skip guards everything below: entries are immutable
         between user actions, so a steady-state refresh (no entry changed)
-        performs no ``configure`` calls at all — canvas-backed CTk widgets
-        redraw on every configure, which used to make long lists repaint
-        themselves wholesale on each refresh.
+        performs no ``configure`` calls at all — keeping long-list refreshes
+        near zero-cost even though tkinter work still happens per refresh.
+        ``footage_paths`` maps segment numbers to their OBS video paths (one
+        dict per refresh) for the ⏩ button's enabled state.
         """
         assert self.session is not None
         is_playing = bool(
@@ -2537,6 +2779,11 @@ class TimestampApp:
             and playback_key is not None
             and os.path.abspath(os.path.join(self.session.output_dir, entry.audio_file))
             == playback_key
+        )
+        has_footage = bool(
+            entry.kind == "timestamp"
+            and entry.recording_number is not None
+            and (footage_paths or {}).get(entry.recording_number)
         )
         signature = (
             entry.status,
@@ -2549,15 +2796,16 @@ class TimestampApp:
             entry.label,
             tuple(entry.tags),
             entry.elapsed_seconds,
+            has_footage,
         )
         if widgets["signature"] == signature:
             return
         widgets["signature"] = signature
 
         dot_color, text_color = self._entry_state_colors(entry, is_playing)
-        widgets["dot"].configure(text_color=dot_color)
+        widgets["dot"].configure(fg=dot_color)
         widgets["label"].configure(
-            text=self._entry_label(entry, is_playing), text_color=text_color
+            text=self._entry_label(entry, is_playing), fg=text_color
         )
         shot_button = widgets["shot_button"]
         if shot_button is not None:
@@ -2567,6 +2815,15 @@ class TimestampApp:
                 state="normal" if entry.screenshot_file else "disabled"
             )
 
+        footage_button = widgets.get("footage_button")
+        if footage_button is not None:
+            # ⏩ enabled whenever the entry's segment has a known OBS video
+            # path — watching the moment is valid in every clickable state.
+            footage_state = "normal" if has_footage else "disabled"
+            if widgets["footage_state"] != footage_state:
+                footage_button.configure(state=footage_state)
+                widgets["footage_state"] = footage_state
+
         take_button = widgets.get("take_button")
         if take_button is not None:
             # Quick-take control: hidden until the entry has saved audio,
@@ -2575,16 +2832,16 @@ class TimestampApp:
                 take_button.grid()
                 take_button.configure(
                     text="■ Stop",
-                    fg_color=Theme.RED,
-                    hover_color=Theme.RED_HOVER,
+                    bg=Theme.RED,
+                    activebackground=Theme.RED_HOVER,
                     state="normal",
                 )
             elif entry.status == "completed":
                 take_button.grid()
                 take_button.configure(
                     text="🎙",
-                    fg_color=Theme.BTN_SURFACE,
-                    hover_color=Theme.BTN_SURFACE_HOVER,
+                    bg=Theme.BTN_SURFACE,
+                    activebackground=Theme.BTN_SURFACE_HOVER,
                     state="normal",
                 )
             else:
@@ -2595,64 +2852,71 @@ class TimestampApp:
             self._rebuild_meta_chips(widgets["meta_frame"], entry)
             widgets["meta_signature"] = meta_signature
 
-    def _rebuild_meta_chips(self, meta_frame: ctk.CTkFrame, entry: TimestampEntry) -> None:
+    def _rebuild_meta_chips(self, meta_frame: tk.Frame, entry: TimestampEntry) -> None:
         """Recreate the inline label/tag chips inside an existing frame.
 
         Shows up to ``ROW_TAG_CHIPS`` tag chips plus a "+N” overflow chip so
         a heavily tagged entry can never push the action icons off-row.
-        Chips forward clicks to the row's record/stop/play handler.
+        Chips forward clicks to the row's record/stop/play handler. Plain
+        tk.Label chips: tag-colored backgrounds keep the accent, minus the
+        rounded corners (accepted trade-off of the flat-row diet).
         """
         for child in meta_frame.winfo_children():
             child.destroy()
         row_click = lambda _event=None, eid=entry.id: self._click_timestamp(eid)
 
-        def add_chip(widget: ctk.CTkLabel) -> None:
+        def add_chip(widget: tk.Label) -> None:
             widget.bind("<Button-1>", row_click)
             widget.configure(cursor="hand2")
 
         next_column = 0
         if entry.label:
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=elide_middle(f'“{entry.label}”', ROW_LABEL_MAX_CHARS),
                 font=Theme.FONT_SMALL,
-                text_color=Theme.TEXT_BRIGHT,
+                fg=Theme.TEXT_BRIGHT,
+                bg=Theme.BG_ENTRY,
                 anchor="w",
+                takefocus=0,
             )
             chip.grid(row=0, column=next_column, padx=(0, 6), sticky="w")
             add_chip(chip)
             next_column += 1
         visible_tags = entry.tags[:ROW_TAG_CHIPS]
         for tag_index, tag_name in enumerate(visible_tags):
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=f" {tag_name} ",
                 font=Theme.FONT_SMALL,
-                fg_color=self._tag_color(tag_name),
-                text_color=Theme.TEXT_BRIGHT,
-                corner_radius=5,
-                height=16,
+                bg=self._tag_color(tag_name),
+                fg=Theme.TEXT_BRIGHT,
+                takefocus=0,
             )
             chip.grid(row=0, column=next_column + tag_index, padx=(0, 4), sticky="w")
             add_chip(chip)
         hidden_tags = len(entry.tags) - len(visible_tags)
         if hidden_tags > 0:
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=f"+{hidden_tags}",
                 font=Theme.FONT_SMALL,
-                text_color=Theme.TEXT_DIM,
+                fg=Theme.TEXT_DIM,
+                bg=Theme.BG_ENTRY,
+                takefocus=0,
             )
             chip.grid(
                 row=0, column=next_column + len(visible_tags), padx=(0, 4), sticky="w"
             )
             add_chip(chip)
         if len(entry.takes) > 1:
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=f"🎙 {len(entry.takes)} takes",
                 font=Theme.FONT_SMALL,
-                text_color=Theme.TEXT_DIM,
+                fg=Theme.TEXT_DIM,
+                bg=Theme.BG_ENTRY,
+                takefocus=0,
             )
             chip.grid(
                 row=0,
@@ -2816,10 +3080,21 @@ class TimestampApp:
             self._update_action_state()
             self._set_status("OBS is recording. Set a project before adding timestamps.", Theme.AMBER)
             return
+        # A start event arriving while a segment timer already runs means OBS
+        # joined a live segment (a manual ▶ timer OBS continues, or an already
+        # recording connection synced into a fresh segment): the segment timer
+        # started before the video, so watch-from-here offsets need to know
+        # where the video begins and entries stamped before then clamp to 0.
+        timer_was_running = bool(self.session.timer_running)
         self.session.start_timer(recording_name)
-        if recording_path and self.session.current_recording_number is not None:
+        recording_number = self.session.current_recording_number
+        if recording_path and recording_number is not None:
             self.session.set_recording_path(
-                self.session.current_recording_number, str(recording_path)
+                recording_number, str(recording_path)
+            )
+        if timer_was_running and recording_number is not None:
+            self.session.set_recording_video_start(
+                recording_number, self.session.elapsed_seconds()
             )
         self._update_action_state()
         self._schedule_list_refresh()

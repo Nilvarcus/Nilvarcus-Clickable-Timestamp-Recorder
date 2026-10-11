@@ -64,6 +64,16 @@ When a segment's recording video path is known, its header gets a `Footage:` lin
 
 Segments without a stored path render exactly as before — plain header, no Footage line.
 
+Each timestamp (any state — pending included: the moment exists whether or not a note was recorded for it) in a segment with a known video path also gets its own indented Footage line linking the segment video **at the entry's in-video offset** as a `#t=` media fragment:
+
+```markdown
+- 001 [00:12:34](R01-001_00-12-34.wav) — completed, 4.2s
+  - ![[R01-001_00-12-34.jpg]]
+  - Footage: [[21-08][14-55-19].mp4](file:///E:/Videos/%5B21-08%5D%5B14-55-19%5D.mp4#t=754)
+```
+
+The fragment is best-effort: players/handlers that honor media fragments (VLC, browsers) jump straight to the moment; others simply open the video from the start, which is never worse than before. Replay entries keep their existing fragment-less `Footage:` line — the clip itself is the moment, and the in-clip offset from its save to the marked point depends on the replay-buffer length, which the app never learns. Offsets are exact for segments started by an OBS event; when the app connects to (or an OBS recording joins) an already-rolling session, the video's own start inside the segment is unknowable and offsets are nearest-to-start approximations — see `video_start_elapsed` below for the one exception the app can handle exactly.
+
 Ungrouped entries keep the legacy line form without a number prefix:
 
 ```markdown
@@ -111,11 +121,11 @@ Deleting a timestamp removes its entry from the log and `session.json` and also 
 
 `session.json` stores:
 
-- format version (`6`);
+- format version (`7`);
 - project name;
 - timer start metadata and running state;
 - the next recording-segment number; and
-- recording segments, each with its number, display name (OBS file name when known), start time, end time once stopped, and the absolute OBS video path when reported (`path`).
+- recording segments, each with its number, display name (OBS file name when known), start time, end time once stopped, the absolute OBS video path when reported (`path`), and an optional `video_start_elapsed` — the in-segment time at which that video begins, set only when an OBS recording joined a segment timer that was already running (a manual ▶ timer OBS continued), so watch-from-here offsets subtract the video's start; normal segments leave it set to none.
 
 Each timestamp entry stores:
 
@@ -135,7 +145,7 @@ Each timestamp entry stores:
 
 Replay-kind entries additionally store `replay_file`, the absolute path of the OBS-saved replay video they were created from; regular timestamps leave it unset.
 
-It is the machine-readable source of truth for restoring the timestamp list. Version 1 files without labels or tags load unchanged with empty annotations; version 1–3 files have no screenshot fields, so their entries load with `screenshot_file` unset and the next save writes version 4; version 4 files load with `transcript` as `null` and the next save writes version 5; version 5 files have no kind fields, so their entries load as regular timestamps and the next save writes version 6. The `takes` list is optional within version 6: files written before re-recording existed load unchanged, entries that already carry audio synthesize their single take, and the next save persists the explicit list.
+It is the machine-readable source of truth for restoring the timestamp list. Version 1 files without labels or tags load unchanged with empty annotations; version 1–3 files have no screenshot fields, so their entries load with `screenshot_file` unset and the next save writes version 4; version 4 files load with `transcript` as `null` and the next save writes version 5; version 5 files have no kind fields, so their entries load as regular timestamps and the next save writes version 6. The `takes` list is optional within version 6: files written before re-recording existed load unchanged, entries that already carry audio synthesize their single take, and the next save persists the explicit list. Version 6 recordings have no `video_start_elapsed`; they load with it unset (the video is assumed to cover the whole segment) and the next save writes version 7.
 
 ## WAV files
 

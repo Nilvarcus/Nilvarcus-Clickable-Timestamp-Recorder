@@ -379,10 +379,76 @@ class CombinedRecordingTests(unittest.TestCase):
         self.assertEqual(self.events, [("started", None)])
         self.assertTrue(self.manager.is_recording)
         self.manager.on_vendor_event(vendor_event("recording_stopped"))
+        # The main recording's path names the mixed segment, even though the
+        # vertical event is the one that ends the combined session.
         self.assertEqual(
-            self.events, [("started", None), ("stopped", None)]
+            self.events, [("started", None), ("stopped", "main.mp4")]
         )
         self.assertFalse(self.manager.is_recording)
+
+    def _vertical_path_client(self, path):
+        self.manager._req_client = FakeReqClient(
+            output_settings={
+                AITUM_VERTICAL_RECORD_OUTPUT: FakeReqClient.output_settings_response(
+                    path
+                )
+            }
+        )
+
+    def test_vertical_first_session_still_reports_main_path_at_stop(self):
+        # Aitum Vertical's start event can arrive first; the segment must still
+        # end up pointing at the main OBS recording, not the vertical video.
+        self._vertical_path_client("E:/rec/clip-vertical.mp4")
+        self.manager.on_vendor_event(vendor_event("recording_started"))
+        self.manager.on_record_state_changed(self.record_started("E:/rec/main.mp4"))
+        self.manager.on_vendor_event(vendor_event("recording_stopped"))
+        self.manager.on_record_state_changed(self.record_stopped("E:/rec/main.mp4"))
+        self.assertEqual(
+            self.events,
+            [
+                ("started", "E:/rec/clip-vertical.mp4"),
+                ("stopped", "E:/rec/main.mp4"),
+            ],
+        )
+
+    def test_main_path_preferred_regardless_of_stop_order(self):
+        for main_stops_last in (False, True):
+            with self.subTest(main_stops_last=main_stops_last):
+                self.setUp()
+                self._vertical_path_client("E:/rec/clip-vertical.mp4")
+                self.manager.on_vendor_event(vendor_event("recording_started"))
+                self.manager.on_record_state_changed(self.record_started("E:/rec/main.mp4"))
+                if main_stops_last:
+                    self.manager.on_vendor_event(vendor_event("recording_stopped"))
+                    self.manager.on_record_state_changed(self.record_stopped("E:/rec/main.mp4"))
+                else:
+                    self.manager.on_record_state_changed(self.record_stopped("E:/rec/main.mp4"))
+                    self.manager.on_vendor_event(vendor_event("recording_stopped"))
+                self.assertEqual(self.events[-1], ("stopped", "E:/rec/main.mp4"))
+
+    def test_finished_session_does_not_leak_path_into_next(self):
+        # After a main-only session, a vertical-only session must report its
+        # own file rather than reuse the stale main path.
+        self.manager.on_record_state_changed(self.record_started("E:/rec/old-main.mp4"))
+        self.manager.on_record_state_changed(self.record_stopped("E:/rec/old-main.mp4"))
+        self._vertical_path_client("E:/rec/new-vertical.mp4")
+        self.manager.on_vendor_event(vendor_event("recording_started"))
+        self.assertEqual(
+            self.events[-1], ("started", "E:/rec/new-vertical.mp4")
+        )
+
+    def test_duplicate_stop_does_not_poison_the_next_session(self):
+        self.manager.on_record_state_changed(self.record_started("E:/rec/old-main.mp4"))
+        self.manager.on_record_state_changed(self.record_stopped("E:/rec/old-main.mp4"))
+        # A repeated stop event (OBS re-reports the final path) is a no-op and
+        # must not cache a path for the next recording.
+        self.manager.on_record_state_changed(self.record_stopped("E:/rec/ghost.mp4"))
+        self.assertTrue(self.manager._main_record_path is None)
+        self._vertical_path_client("E:/rec/new-vertical.mp4")
+        self.manager.on_vendor_event(vendor_event("recording_started"))
+        self.assertEqual(
+            self.events[-1], ("started", "E:/rec/new-vertical.mp4")
+        )
 
     def test_duplicate_vertical_events_are_noops(self):
         self.manager.on_vendor_event(vendor_event("recording_started"))

@@ -56,6 +56,14 @@ Example:
   - Clicking **Disconnect** also pauses auto-connect until **Connect OBS** is clicked again.
   - Edited in-app via the header ⚙ button (host, port, password, auto-connect), which saves and reconnects immediately.
 - `audio_device`: selected PortAudio input index, or `null` for system default.
+- `playback_settings`: optional watch-from-here player override for the ⏩ button (`{"player_path": "", "player_args": null}`).
+  - When `player_path` is empty the app auto-detects a seek-capable player: mpv on `PATH`, then VLC under `%ProgramFiles%\VideoLAN\VLC`. With neither installed, footage opens in the default player from the start and the offset time is copied to the clipboard.
+  - Set `player_path` to any player executable to override detection. By default that player is launched as `player <file>` (opens from the start); pair it with `player_args` to seek — a list of strings where `{start}` becomes the seek position in seconds (rounded to 0.5) and `{path}` the video file:
+    - mpv: `"player_args": ["--start={start}", "{path}"]`
+    - VLC: `"player_args": ["--no-one-instance", "--start-time={start}", "{path}"]`
+  - `{path}` is substituted with the video path in native separators: OBS reports Windows recordings with forward slashes (`C:/Videos/clip.mp4`), which players read as a URI with a one-letter scheme and silently fail to open (the player starts empty). URI values you pass yourself (`file:///C:/Videos/clip.mp4`) are left untouched.
+  - `--no-one-instance` (VLC) keeps the seek authoritative: with VLC's "one instance" mode on, a new input can be forwarded to the running instance and the start time dropped, so ⏩ would open at `0:00` instead of the moment. Each ⏩ click closes the player window the app opened last, so only one ⏩-launched window exists at a time regardless of the configured player.
+  - Invalid values degrade to the auto-detect defaults; edited only by hand in `keybinds.json` (no in-app dialog), read on launch.
 - `mic_settings.silence_threshold`: int16 RMS level a microphone signal must reach to count as voice (default `250.0`).
   - Raise it if background noise keeps silent recordings alive; lower it if quiet speech gets cut off.
   - Invalid values fall back to the default.

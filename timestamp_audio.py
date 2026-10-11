@@ -22,7 +22,7 @@ from typing import Callable, Optional
 
 
 SESSION_FILENAME = "session.json"
-SESSION_FORMAT_VERSION = 6
+SESSION_FORMAT_VERSION = 7
 SCREENSHOTS_DIRNAME = "Screenshots"
 RECENT_PROJECTS_LIMIT = 5
 LABEL_MAX_LENGTH = 200
@@ -182,6 +182,190 @@ def replay_file_uri(replay_path: Optional[str]) -> Optional[str]:
         return None
 
 
+# ── Watch-from-here: opening footage at an entry's offset ──────────────────
+
+# Seek-argument templates per known player, used when players are
+# auto-detected (or as the documented defaults for a hand-picked player).
+# ``{start}`` becomes the seek position and ``{path}`` the video file.
+MPV_FOOTAGE_ARGS = ["--start={start}", "{path}"]
+# ``--no-one-instance`` keeps the seek argument authoritative: with VLC's
+# "one instance" mode on, the new input is forwarded to the running instance
+# and the start time can be dropped, degrading the jump to open-at-zero.
+VLC_FOOTAGE_ARGS = ["--no-one-instance", "--start-time={start}", "{path}"]
+# A configured player without an args template opens from the start.
+FOOTAGE_ARGS_DEFAULT = ["{path}"]
+
+
+def footage_offset_seconds(
+    elapsed: float, video_start_elapsed: Optional[float]
+) -> float:
+    """Seconds into the segment video at which an entry's moment sits.
+
+    ``elapsed`` is the entry's in-segment time; ``video_start_elapsed`` is
+    the in-segment time at which the OBS video begins (None/0 means the
+    video covers the whole segment — the normal OBS-driven path). Results
+    never go below zero: entries stamped before the video existed (OBS
+    joining an already-running manual timer) clamp to the video start.
+    """
+    start = 0.0 if video_start_elapsed is None else float(video_start_elapsed)
+    return max(0.0, float(elapsed) - start)
+
+
+def footage_seek_value(seconds: float) -> str:
+    """Seek offset for player command lines: seconds rounded to 0.5.
+
+    734 → "734"; 734.4 → "734.5"; 734.5 → "734.5". Compact output keeps
+    command lines readable while staying within half a second of the moment.
+    """
+    value = max(0.0, float(seconds))
+    rounded = round(value * 2.0) / 2.0
+    text = f"{rounded:.1f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def footage_fragment_value(seconds: float) -> str:
+    """Seek offset for ``#t=`` media fragments: compact, no sci notation.
+
+    Millisecond-precision and no trailing zeros: 734 → "734",
+    734.5298 → "734.53", 0 → "0". VLC and browsers honor the fragment;
+    players that ignore it simply open the video from the start.
+    """
+    value = max(0.0, float(seconds))
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _footage_executable_names() -> tuple[str, str]:
+    """Base names probed for mpv and VLC (``.exe`` suffix on Windows)."""
+    if os.name == "nt":
+        return ("mpv.exe", "vlc.exe")
+    return ("mpv", "vlc")
+
+
+def _default_footage_program_dirs() -> list[str]:
+    """Standard Windows install locations probed for VLC."""
+    if os.name != "nt":
+        return []
+    dirs: list[str] = []
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(variable)
+        if base:
+            dirs.append(os.path.join(base, "VideoLAN", "VLC"))
+    return dirs
+
+
+def detect_footage_players(
+    path_env: Optional[str] = None, program_dirs: Optional[list[str]] = None
+) -> tuple[Optional[str], Optional[list[str]]]:
+    """Find a seek-capable footage player; never raises.
+
+    Prefers mpv found on ``path_env`` (default: ``$PATH``), then VLC under
+    ``program_dirs`` (default: the ``%ProgramFiles%`` VLC locations). Returns
+    ``(player_path, args)`` matched to the player's seek flag, or ``(None,
+    None)`` when nothing usable is installed — the caller then degrades to
+    opening footage in the default player from the start. Both probes are
+    injectable so tests run without any real player.
+    """
+    exe_mpv, exe_vlc = _footage_executable_names()
+    search = str(
+        path_env if path_env is not None else os.environ.get("PATH", "")
+    )
+    for directory in search.split(os.pathsep):
+        directory = directory.strip().strip('"')
+        if not directory:
+            continue
+        candidate = os.path.join(directory, exe_mpv)
+        if os.path.isfile(candidate):
+            return candidate, list(MPV_FOOTAGE_ARGS)
+    dirs = (
+        list(program_dirs)
+        if program_dirs is not None
+        else _default_footage_program_dirs()
+    )
+    for directory in dirs:
+        candidate = os.path.join(directory, exe_vlc)
+        if os.path.isfile(candidate):
+            return candidate, list(VLC_FOOTAGE_ARGS)
+    return None, None
+
+
+def normalize_footage_path(path: object) -> str:
+    """Return ``path`` in the form a player accepts on its command line.
+
+    OBS reports Windows recording paths with forward slashes
+    (``C:/Videos/clip.mp4``). Players read such an argument as a URI with a
+    bogus one-letter scheme instead of converting it to a ``file:///`` URI,
+    so the media silently fails to load and the player opens empty — the
+    reason the ⏩ button started a blank VLC while 📼 (ShellExecute, which
+    normalizes the same path) worked. Native separators are accepted by
+    every player, so paths are normalized. Values that already carry a
+    scheme (``file:///…``) are left untouched.
+
+    Never raises: unusable values pass through as text.
+    """
+    text = str(path or "")
+    if not text:
+        return text
+    if "://" in text:
+        return text
+    try:
+        return os.path.normpath(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def build_footage_command(
+    player_path: Optional[str],
+    player_args: Optional[list[str]],
+    path: str,
+    seconds: float,
+) -> list[str]:
+    """Build the argv that opens ``path`` at ``seconds`` in a player.
+
+    ``player_args`` is a ``{start}``/``{path}`` template list; None, empty,
+    or non-string items fall back to ``["{path}"]`` (open from the start).
+    The ``{path}`` substitution is normalized (see normalize_footage_path)
+    so a forward-slash OBS path is not read as a URI by the player.
+    Raises ``ValueError`` on unusable players so the GUI can surface the
+    problem instead of launching nothing.
+    """
+    player = str(player_path or "").strip()
+    if not player:
+        raise ValueError("No footage player is configured")
+    if not os.path.isfile(player):
+        raise ValueError(f"Footage player not found: {player}")
+    args = list(player_args) if player_args else list(FOOTAGE_ARGS_DEFAULT)
+    if not all(isinstance(item, str) for item in args):
+        raise ValueError("playback_settings.player_args must be a list of strings")
+    start = footage_seek_value(seconds)
+    file_arg = normalize_footage_path(path)
+    return [
+        player,
+        *(item.replace("{start}", start).replace("{path}", file_arg) for item in args),
+    ]
+
+
+def sanitize_playback_settings(raw) -> dict:
+    """Validate the ``playback_settings`` key from keybinds.json.
+
+    Returns ``{"player_path": str, "player_args": Optional[list[str]]}``;
+    a missing or malformed key degrades to auto-detect (empty path, no
+    template). Hand-edited configs always load, never crash.
+    """
+    settings: dict = {"player_path": "", "player_args": None}
+    if not isinstance(raw, dict):
+        return settings
+    settings["player_path"] = str(raw.get("player_path") or "").strip()
+    args = raw.get("player_args")
+    if (
+        isinstance(args, list)
+        and args
+        and all(isinstance(item, str) and item for item in args)
+    ):
+        settings["player_args"] = list(args)
+    return settings
+
+
 def parse_time_input(text: str) -> Optional[float]:
     """Parse SS, MM:SS, or HH:MM:SS text into seconds; None when invalid."""
     parts = str(text).strip().split(":")
@@ -309,18 +493,29 @@ class RecordingInfo:
     started_at: float
     ended_at: Optional[float] = None
     path: Optional[str] = None
+    # In-segment elapsed time at which the segment's OBS video begins. None
+    # (or 0) means the video covers the whole segment — the normal OBS-driven
+    # path. Set only when an OBS recording joins a segment timer that was
+    # already running, so watch-from-here offsets subtract the video's start.
+    video_start_elapsed: Optional[float] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "RecordingInfo":
         raw_name = data.get("name")
         raw_ended = data.get("ended_at")
         raw_path = data.get("path")
+        raw_video_start = data.get("video_start_elapsed")
         return cls(
             number=int(data["number"]),
             name=str(raw_name) if raw_name else None,
             started_at=float(data["started_at"]),
             ended_at=float(raw_ended) if raw_ended is not None else None,
             path=str(raw_path) if raw_path else None,
+            video_start_elapsed=(
+                float(raw_video_start)
+                if isinstance(raw_video_start, (int, float))
+                else None
+            ),
         )
 
     def header(self) -> str:
@@ -571,6 +766,55 @@ class TimestampSession:
             return
         recording.path = cleaned
         self.save()
+
+    def set_recording_video_start(self, number: int, elapsed: float) -> None:
+        """Note where the segment's OBS video begins inside the segment.
+
+        Used when an OBS recording start event arrives while a segment timer
+        is already running (a manual ▶ timer OBS then joins, or the app opens
+        a project mid-recording): the video covers only part of the segment,
+        so watch-from-here offsets must be relative to the video's start.
+        Normal OBS-driven segments need no call — the field stays None (treated
+        as 0). Unknown numbers and unusable elapseds are safe no-ops.
+        """
+        recording = self._get_recording(number)
+        if recording is None:
+            return
+        try:
+            value = max(0.0, float(elapsed))
+        except (TypeError, ValueError):
+            return
+        if recording.video_start_elapsed == value:
+            return
+        recording.video_start_elapsed = value
+        self.save()
+
+    def get_entry_footage(self, entry_id: int) -> Optional[tuple[str, float]]:
+        """Resolve where an entry's moment lives in its segment's footage.
+
+        Returns ``(video_path, seconds_into_video)`` for timestamp entries
+        whose segment has a known OBS recording path; None otherwise —
+        replay-kind entries open their **own** linked clip (its start differs
+        from the moment by the buffer length, which the app never learns),
+        and ungrouped or manual-timer entries have no footage at all. This is
+        the single source of truth for the GUI's ⏩ launcher and the
+        Markdown per-entry Footage line.
+        """
+        entry = self.get(entry_id)
+        if entry is None or entry.kind != "timestamp":
+            return None
+        recording = (
+            self._get_recording(entry.recording_number)
+            if entry.recording_number is not None
+            else None
+        )
+        path = recording.path if recording is not None else None
+        if not path:
+            return None
+        offset = footage_offset_seconds(
+            entry.elapsed_seconds, recording.video_start_elapsed
+        )
+        return str(path), offset
 
     def _attach_to_segment(self, entry: TimestampEntry) -> None:
         """Assign a recording segment and per-segment index to a new entry."""
@@ -1050,8 +1294,7 @@ class TimestampSession:
             sections.append((recording.header(), grouped, recording))
         return sections
 
-    @staticmethod
-    def _markdown_entry_lines(entry: TimestampEntry) -> list[str]:
+    def _markdown_entry_lines(self, entry: TimestampEntry) -> list[str]:
         timestamp = format_elapsed_display(entry.elapsed_seconds)
         state = entry.status
         if entry.duration_seconds is not None:
@@ -1079,6 +1322,18 @@ class TimestampSession:
             # Obsidian wikilink embed: bare filename resolves vault-wide,
             # so no folder path is needed.
             lines.append(f"  - ![[{os.path.basename(entry.screenshot_file)}]]")
+        if entry.kind == "timestamp":
+            footage = self.get_entry_footage(entry.id)
+            if footage:
+                video_path, offset = footage
+                uri = replay_file_uri(video_path)
+                if uri:
+                    footage_name = os.path.basename(str(video_path))
+                    # Media fragment: honored by VLC/browser handlers, safely
+                    # ignored by players that do not parse it (opens at 0).
+                    lines.append(
+                        f"  - Footage: [{footage_name}]({uri}#t={footage_fragment_value(offset)})"
+                    )
         if len(entry.takes) > 1:
             # Alternate retakes under the headline link; the active take is
             # already linked there, so only the others are listed.

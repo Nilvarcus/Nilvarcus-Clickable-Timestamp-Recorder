@@ -73,9 +73,24 @@ When the timer stops — from OBS or the in-app button — the app finalizes an 
 
 ### Reading the timestamp list
 
-Each timestamp is one compact row. A colored dot shows the state: grey pending, red recording (or error), green saved, blue while playing; replay entries are amber until an audio take is recorded, then green (red while recording/failed). The row itself is the button — clicking anywhere on it records, stops, or plays exactly as before. After the `R##-###` reference and time you'll see the entry's label in quotes and up to three tag chips (more tags collapse into a `+N` chip). The small icons at the end open the timestamp's screenshot (📷, timestamps only), record another take (🎙, completed timestamps only — see *Retakes* below), open the replay video (🎬, replays only), edit label/tags (✎), and delete the entry (✕). The **📷** icon stays greyed out until the snapshot has finished saving (and on older entries created before screenshots existed); if the JPEG was moved or deleted, clicking it shows an error in the status bar instead.
+Each timestamp is one compact row. A colored dot shows the state: grey pending, red recording (or error), green saved, blue while playing; replay entries are amber until an audio take is recorded, then green (red while recording/failed). The row itself is the button — clicking anywhere on it records, stops, or plays exactly as before. After the `R##-###` reference and time you'll see the entry's label in quotes and up to three tag chips (more tags collapse into a `+N` chip). The small icons at the end open the timestamp's footage at that moment (**⏩**, timestamps only), open the screenshot (📷), record another take (🎙, completed timestamps only — see *Retakes* below), open the replay video (🎬, replays only), edit label/tags (✎), and delete the entry (✕).
+
+The **⏩** button is the watch-from-here jump: it opens the timestamp's segment video **seeked to the entry's position** instead of from the start. It works in every clickable state (even pending rows — watching the moment does not need recorded audio) and stays greyed for entries without footage (in-app timer-only segments, ungrouped entries, sessions from older app versions). Replay rows keep their 🎬 button, which opens the clip itself. The **📷** icon stays greyed out until the snapshot has finished saving (and on older entries created before screenshots existed); if the JPEG was moved or deleted, clicking it shows an error in the status bar instead.
 
 The list follows you while you work: as long as you're already near the bottom, every new timestamp (hotkey, ＋ button, manual entry, or OBS replay save) scrolls itself into view. Scroll up to read older entries and it stops following — scroll back down and it picks up where it left off. Opening or switching a project always lands you on the latest segment.
+
+### Which player does ⏩ use?
+
+The app resolves a seek-capable player on first use, in this order:
+
+1. `playback_settings.player_path` in `keybinds.json` (optionally with a `playback_settings.player_args` template — see [configuration.md](configuration.md));
+2. **mpv** found on `PATH`;
+3. **VLC** under `%ProgramFiles%\VideoLAN\VLC`;
+4. none of them: the video opens in your default player **from the start**, the offset `HH:MM:SS` is copied to the clipboard, and the status bar explains how to get proper seeks.
+
+VLC is launched with `--no-one-instance` so the seek always applies — the seek cannot be handed to an already-running VLC, which may drop the start time. To keep windows from piling up, every ⏩ click **closes the player window the app opened last** before starting the new one, so at most one ⏩-launched player exists at a time while each jump still seeks correctly. Player windows you opened yourself are never closed, and closing the app leaves the running player alone. The video path is passed in native separators — OBS reports Windows paths with forward slashes, which players misread as a URI and never load (a blank player window).
+
+Timestamps in segments the app joined mid-recording (OBS was already rolling when the app connected) are approximate: the app cannot know exactly when OBS's video began, so late-joined entries may sit a little early in the footage. Segments started by an OBS event are exact; when an OBS recording joins an already-running manual timer, the app notes where the video began and offsets stay exact.
 
 ## Retakes: multiple takes per timestamp
 

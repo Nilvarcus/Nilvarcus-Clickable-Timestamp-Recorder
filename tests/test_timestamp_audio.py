@@ -19,15 +19,24 @@ from timestamp_audio import (
     AudioError,
     AudioRecorder,
     DEFAULT_TAG_COLOR,
+    FOOTAGE_ARGS_DEFAULT,
     MIC_LEVEL_CLAMP_RMS,
+    MPV_FOOTAGE_ARGS,
     RecordingInfo,
     SESSION_FILENAME,
     SilenceMonitor,
     TAG_NAME_MAX_LENGTH,
     TimestampEntry,
     TimestampSession,
+    VLC_FOOTAGE_ARGS,
+    _footage_executable_names,
+    build_footage_command,
     clean_label,
     clean_tags,
+    detect_footage_players,
+    footage_fragment_value,
+    footage_offset_seconds,
+    footage_seek_value,
     format_elapsed,
     format_elapsed_display,
     normalize_level,
@@ -39,6 +48,7 @@ from timestamp_audio import (
     replay_file_uri,
     rms_int16,
     sanitize_project_name,
+    sanitize_playback_settings,
     sanitize_recent_projects,
     sanitize_tag_definitions,
     update_recent_projects,
@@ -186,7 +196,7 @@ class TimestampSessionTests(unittest.TestCase):
             TimestampSession(folder, load_existing=False).create_timestamp(1)
             with open(os.path.join(folder, "session.json"), encoding="utf-8") as handle:
                 data = json.load(handle)
-            self.assertEqual(data["version"], 6)
+            self.assertEqual(data["version"], 7)
             self.assertEqual(data["entries"][0]["id"], 1)
             self.assertEqual(data["recordings"], [])
             self.assertEqual(data["next_recording_number"], 1)
@@ -551,7 +561,7 @@ class RecordingSegmentTests(unittest.TestCase):
             self.assertIn("- 001 00:00:20 — pending", markdown)
             self.assertNotIn("002 [00:00", markdown)
 
-    def test_version_two_session_migrates_to_earlier_group_and_saves_v4(self):
+    def test_version_two_session_migrates_to_earlier_group_and_saves_current(self):
         with tempfile.TemporaryDirectory() as folder:
             legacy = {
                 "version": 2,
@@ -582,7 +592,7 @@ class RecordingSegmentTests(unittest.TestCase):
             restored.save()
             with open(os.path.join(folder, "session.json"), encoding="utf-8") as handle:
                 data = json.load(handle)
-            self.assertEqual(data["version"], 6)
+            self.assertEqual(data["version"], 7)
 
             with open(os.path.join(folder, "Legacy.md"), encoding="utf-8") as handle:
                 markdown = handle.read()
@@ -734,6 +744,482 @@ class RecordingSegmentTests(unittest.TestCase):
             second_section = markdown[second_header_at:]
             self.assertNotIn("Footage:", second_section)
             self.assertIn(f"{plain.recording_index:03d}", second_section)
+
+    def test_markdown_entry_footage_respects_video_start(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            entry = session.create_timestamp(120)
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            session.set_recording_video_start(1, 45.0)
+            session.save()
+
+            with open(os.path.join(folder, "My Project.md"), encoding="utf-8") as handle:
+                markdown = handle.read()
+            uri = replay_file_uri("E:/rec/[21-08][10-00-00].mp4")
+            self.assertIn(f"({uri}#t=75)", markdown)
+
+    def test_markdown_entry_footage_absent_cases_stay_clean(self):
+        """No path → no per-entry line; ungrouped → none; replays keep their own."""
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.create_timestamp(10)  # ungrouped: before any recording
+            session.start_timer("[21-08][10-00-00]")
+            pending = session.create_timestamp(20)
+            replay = session.create_replay_entry("E:/Vids/replay.mp4")
+            session.stop_timer()
+            session.start_timer("[21-08][11-00-00]")
+            session.create_timestamp(30)  # segment without a path
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            session.save()
+
+            with open(os.path.join(folder, "My Project.md"), encoding="utf-8") as handle:
+                markdown = handle.read()
+            uri_seg = replay_file_uri("E:/rec/[21-08][10-00-00].mp4")
+            uri_replay = replay_file_uri("E:/Vids/replay.mp4")
+            # The pending timestamp in the pathed segment gets the line.
+            self.assertIn(
+                f"  - Footage: [[21-08][10-00-00].mp4]({uri_seg}#t=20)", markdown
+            )
+            # The replay's own line stays fragment-less (newline-terminated
+            # so the assertion cannot swallow a hypothetical suffix).
+            self.assertIn(f"  - Footage: [replay.mp4]({uri_replay})\n", markdown)
+            # Ungrouped section: no footage at all.
+            earlier_at = markdown.index("### Earlier timestamps")
+            earlier_section = markdown[
+                earlier_at:markdown.index("### [21-08][10-00-00]")
+            ]
+            self.assertNotIn("Footage:", earlier_section)
+            # Segment without a path: no Footage lines under it.
+            second_section = markdown[markdown.index("### [21-08][11-00-00]"):]
+            self.assertNotIn("Footage:", second_section)
+
+    def test_markdown_entry_footage_includes_pending_entries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            session.create_timestamp(15)  # pending, never recorded
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            session.save()
+
+            with open(os.path.join(folder, "My Project.md"), encoding="utf-8") as handle:
+                markdown = handle.read()
+            uri = replay_file_uri("E:/rec/[21-08][10-00-00].mp4")
+            self.assertIn(f"  - Footage: [[21-08][10-00-00].mp4]({uri}#t=15)", markdown)
+
+    def test_markdown_entry_lines_link_moment_when_segment_has_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            linked = session.create_timestamp(734)
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            session.save()
+
+            with open(os.path.join(folder, "My Project.md"), encoding="utf-8") as handle:
+                markdown = handle.read()
+            uri = replay_file_uri("E:/rec/[21-08][10-00-00].mp4")
+            # Per-entry line: the segment video at the entry's offset.
+            self.assertIn(
+                f"  - Footage: [[21-08][10-00-00].mp4]({uri}#t=734)", markdown
+            )
+            # The segment-header line keeps its original fragment-less shape.
+            self.assertIn(f"- Footage: [[21-08][10-00-00].mp4]({uri})\n", markdown)
+            entry_at = markdown.index(f"{linked.recording_index:03d} 00:12:14")
+            moment_at = markdown.index("  - Footage: [", entry_at)
+            self.assertLess(entry_at, moment_at)
+
+
+class EntryFootageResolutionTests(unittest.TestCase):
+    """get_entry_footage: the single resolution behind ⏩ and Markdown."""
+
+    def _session(self, folder):
+        return TimestampSession(folder, "My Project", load_existing=False)
+
+    def test_timestamp_in_segment_with_path_resolves(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            entry = session.create_timestamp(734)
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            self.assertEqual(
+                session.get_entry_footage(entry.id),
+                ("E:/rec/[21-08][10-00-00].mp4", 734.0),
+            )
+
+    def test_video_start_elapsed_is_subtracted(self):
+        """A video that joined a live segment starts after the timer did."""
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            entry = session.create_timestamp(120)
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/joined.mp4")
+            session.set_recording_video_start(1, 45.0)
+            video, offset = session.get_entry_footage(entry.id)
+            self.assertEqual(video, "E:/rec/joined.mp4")
+            self.assertEqual(offset, 75.0)
+
+    def test_entries_before_the_video_clamp_to_zero(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            early = session.create_timestamp(30)
+            late = session.create_timestamp(120)
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            session.set_recording_video_start(1, 90.0)
+            self.assertEqual(session.get_entry_footage(early.id)[1], 0.0)
+            self.assertEqual(session.get_entry_footage(late.id)[1], 30.0)
+
+    def test_segment_without_path_resolves_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            entry = session.create_timestamp(10)
+            session.stop_timer()
+            self.assertIsNone(session.get_entry_footage(entry.id))
+
+    def test_ungrouped_timestamp_resolves_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            entry = session.create_timestamp(10)
+            self.assertIsNone(session.get_entry_footage(entry.id))
+
+    def test_replay_entry_resolves_none_even_in_a_path_segment(self):
+        """Replays open their own clip; the in-clip offset is unknowable."""
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            session.start_timer("[21-08][10-00-00]")
+            replay = session.create_replay_entry("E:/Vids/replay.mp4")
+            session.stop_timer()
+            session.set_recording_path(1, "E:/rec/[21-08][10-00-00].mp4")
+            self.assertIsNone(session.get_entry_footage(replay.id))
+
+    def test_unknown_entry_id_resolves_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = self._session(folder)
+            self.assertIsNone(session.get_entry_footage(999))
+
+
+class RecordingVideoStartTests(unittest.TestCase):
+    """RecordingInfo.video_start_elapsed: persistence + safe setters."""
+
+    def test_set_recording_video_start_sets_clamps_and_noops(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = TimestampSession(folder, "My Project", load_existing=False)
+            session.start_timer("[21-08][10-00-00]")
+
+            # Unknown segment numbers are safe no-ops.
+            session.set_recording_video_start(99, 5.0)
+            self.assertIsNone(session.recordings[0].video_start_elapsed)
+
+            session.set_recording_video_start(1, 45.0)
+            self.assertEqual(session.recordings[0].video_start_elapsed, 45.0)
+
+            # Unusable values never write.
+            session.set_recording_video_start(1, "broken")
+            session.set_recording_video_start(1, None)
+            self.assertEqual(session.recordings[0].video_start_elapsed, 45.0)
+
+            restored = TimestampSession(folder)
+            self.assertEqual(restored.recordings[0].video_start_elapsed, 45.0)
+
+    def test_setting_same_value_skips_the_save(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = TimestampSession(folder, "My Project", load_existing=False)
+            session.start_timer("[21-08][10-00-00]")
+            session.set_recording_video_start(1, 45.0)
+            with patch.object(session, "save") as save_mock:
+                session.set_recording_video_start(1, 45.0)
+                save_mock.assert_not_called()
+
+    def test_negative_video_start_clamps_to_zero(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = TimestampSession(folder, "My Project", load_existing=False)
+            session.start_timer("[21-08][10-00-00]")
+            session.set_recording_video_start(1, -7.0)
+            self.assertEqual(session.recordings[0].video_start_elapsed, 0.0)
+
+    def test_v6_recordings_load_without_video_start_and_save_v7(self):
+        with tempfile.TemporaryDirectory() as folder:
+            legacy = {
+                "version": 6,
+                "project_name": "Legacy",
+                "started_at": 1000.0,
+                "timer_running": False,
+                "next_recording_number": 2,
+                "recordings": [
+                    {
+                        "number": 1,
+                        "name": "[21-08][10-00-00]",
+                        "started_at": 1000.0,
+                        "ended_at": 1065.0,
+                        "path": "E:/rec/[21-08][10-00-00].mp4",
+                    }
+                ],
+                "entries": [
+                    {
+                        "id": 1,
+                        "elapsed_seconds": 12.0,
+                        "created_at": "2024-01-01T00:00:00+00:00",
+                        "status": "pending",
+                        "recording_number": 1,
+                        "recording_index": 1,
+                    }
+                ],
+            }
+            with open(os.path.join(folder, "session.json"), "w", encoding="utf-8") as handle:
+                json.dump(legacy, handle)
+
+            restored = TimestampSession(folder)
+            self.assertIsNone(restored.recordings[0].video_start_elapsed)
+            # Absent video_start_elapsed behaves like 0 when resolving footage.
+            self.assertEqual(
+                restored.get_entry_footage(1),
+                ("E:/rec/[21-08][10-00-00].mp4", 12.0),
+            )
+            restored.save()
+            with open(os.path.join(folder, "session.json"), encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.assertEqual(data["version"], 7)
+            self.assertIn("video_start_elapsed", data["recordings"][0])
+            self.assertIsNone(data["recordings"][0]["video_start_elapsed"])
+
+    def test_v7_field_garbage_loads_as_none(self):
+        with tempfile.TemporaryDirectory() as folder:
+            legacy = {
+                "version": 7,
+                "project_name": "Legacy",
+                "started_at": 1000.0,
+                "timer_running": False,
+                "next_recording_number": 2,
+                "recordings": [
+                    {
+                        "number": 1,
+                        "name": "[21-08][10-00-00]",
+                        "started_at": 1000.0,
+                        "video_start_elapsed": "not-a-number",
+                    }
+                ],
+                "entries": [
+                    {"id": 1, "elapsed_seconds": 12.0, "created_at": ""}
+                ],
+            }
+            with open(os.path.join(folder, "session.json"), "w", encoding="utf-8") as handle:
+                json.dump(legacy, handle)
+            restored = TimestampSession(folder)
+            self.assertIsNone(restored.recordings[0].video_start_elapsed)
+
+
+class FootageOffsetMathTests(unittest.TestCase):
+    """Pure helpers behind watch-from-here offsets and fragments."""
+
+    def test_footage_offset_defaults_and_subtraction(self):
+        self.assertEqual(footage_offset_seconds(734.5, None), 734.5)
+        self.assertEqual(footage_offset_seconds(734.5, 0.0), 734.5)
+        self.assertEqual(footage_offset_seconds(120.0, 45.0), 75.0)
+
+    def test_footage_offset_clamps_negative_to_zero(self):
+        self.assertEqual(footage_offset_seconds(30.0, 90.0), 0.0)
+        self.assertEqual(footage_offset_seconds(0.0, 5.0), 0.0)
+        self.assertEqual(footage_offset_seconds(-2.0, None), 0.0)
+
+    def test_footage_seek_value_rounds_to_half_second(self):
+        self.assertEqual(footage_seek_value(734), "734")
+        self.assertEqual(footage_seek_value(734.4), "734.5")
+        self.assertEqual(footage_seek_value(734.7), "734.5")
+        self.assertEqual(footage_seek_value(0), "0")
+        self.assertEqual(footage_seek_value(-5), "0")
+
+    def test_footage_fragment_value_is_compact(self):
+        self.assertEqual(footage_fragment_value(734), "734")
+        self.assertEqual(footage_fragment_value(734.5), "734.5")
+        self.assertEqual(footage_fragment_value(734.5298), "734.53")
+        self.assertEqual(footage_fragment_value(0.0004), "0")
+        self.assertEqual(footage_fragment_value(-5), "0")
+
+
+class FootagePlayerDetectionTests(unittest.TestCase):
+    """detect_footage_players: mpv on PATH, VLC under Program Files."""
+
+    def _probe_dirs(self, root, subpath):
+        folder = os.path.join(root, *subpath.split("/"))
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def _fake_exe(self, folder, name):
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fake")
+        return path
+
+    def test_detects_mpv_on_path_with_mpv_args(self):
+        mpv, vlc = _footage_executable_names()
+        with tempfile.TemporaryDirectory() as root:
+            mpv_dir = self._probe_dirs(root, "mpvbin")
+            player_path = self._fake_exe(mpv_dir, mpv)
+            found, args = detect_footage_players(path_env=mpv_dir, program_dirs=[])
+            self.assertEqual(found, player_path)
+            self.assertEqual(args, list(MPV_FOOTAGE_ARGS))
+
+    def test_detects_vlc_in_program_dirs_with_vlc_args(self):
+        mpv, vlc = _footage_executable_names()
+        with tempfile.TemporaryDirectory() as root:
+            vlc_dir = self._probe_dirs(root, "VideoLAN/VLC")
+            player_path = self._fake_exe(vlc_dir, vlc)
+            found, args = detect_footage_players(path_env="", program_dirs=[vlc_dir])
+            self.assertEqual(found, player_path)
+            self.assertEqual(args, list(VLC_FOOTAGE_ARGS))
+
+    def test_mpv_takes_priority_over_vlc(self):
+        mpv, vlc = _footage_executable_names()
+        with tempfile.TemporaryDirectory() as root:
+            mpv_dir = self._probe_dirs(root, "mpvbin")
+            vlc_dir = self._probe_dirs(root, "VideoLAN/VLC")
+            self._fake_exe(mpv_dir, mpv)
+            self._fake_exe(vlc_dir, vlc)
+            found, args = detect_footage_players(
+                path_env=mpv_dir, program_dirs=[vlc_dir]
+            )
+            self.assertTrue(found.endswith(mpv))
+            self.assertEqual(args, list(MPV_FOOTAGE_ARGS))
+
+    def test_nothing_found_returns_none_pair(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                detect_footage_players(path_env=root, program_dirs=[root]),
+                (None, None),
+            )
+
+
+class FootageCommandTests(unittest.TestCase):
+    """build_footage_command: template substitution and validation."""
+
+    def _player_file(self, folder):
+        player = os.path.join(folder, "fakeplayer.exe" if os.name == "nt" else "fakeplayer")
+        with open(player, "w", encoding="utf-8") as handle:
+            handle.write("fake")
+        return player
+
+    def test_mpv_template_uses_start_flag(self):
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            argv = build_footage_command(
+                player, list(MPV_FOOTAGE_ARGS), "E:/Vids/[21-08].mp4", 734.4
+            )
+            self.assertEqual(
+                argv,
+                [player, "--start=734.5", os.path.normpath("E:/Vids/[21-08].mp4")],
+            )
+
+    def test_vlc_template_uses_start_time_flag(self):
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            argv = build_footage_command(
+                player, list(VLC_FOOTAGE_ARGS), "E:/Vids/video.mp4", 734.0
+            )
+            self.assertEqual(
+                argv,
+                [
+                    player,
+                    "--no-one-instance",
+                    "--start-time=734",
+                    os.path.normpath("E:/Vids/video.mp4"),
+                ],
+            )
+
+    def test_vlc_template_disables_one_instance_forwarding(self):
+        # One-instance forwarding can drop --start-time; the seek must survive.
+        self.assertEqual(VLC_FOOTAGE_ARGS[:2], ["--no-one-instance", "--start-time={start}"])
+
+    def test_forward_slash_path_is_normalized_for_the_player(self):
+        # OBS reports Windows paths with forward slashes, which players read
+        # as a URI with a bogus scheme and silently fail to open (empty VLC).
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            for template in (list(VLC_FOOTAGE_ARGS), list(MPV_FOOTAGE_ARGS), None):
+                argv = build_footage_command(
+                    player, template, "C:/Users/me/Videos/my clip.mp4", 12.0
+                )
+                self.assertEqual(argv[-1], os.path.normpath("C:/Users/me/Videos/my clip.mp4"))
+                if os.name == "nt":
+                    self.assertNotIn("/", argv[-1])
+
+    @unittest.skipUnless(os.name == "nt", "Windows path separators")
+    def test_windows_drive_path_becomes_native(self):
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            argv = build_footage_command(
+                player, list(VLC_FOOTAGE_ARGS), "C:/Users/me/Videos/my clip.mp4", 5.0
+            )
+            self.assertEqual(argv[-1], "C:\\Users\\me\\Videos\\my clip.mp4")
+
+    def test_file_uri_path_passes_through_unmangled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            argv = build_footage_command(
+                player, None, "file:///C:/Videos/clip.mp4", 5.0
+            )
+            self.assertEqual(argv[-1], "file:///C:/Videos/clip.mp4")
+
+    def test_custom_template_substitutes_every_occurrence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            argv = build_footage_command(
+                player, ["-ss", "{start}", "{path}", "--end={start}"], "v.mp4", 12.0
+            )
+            self.assertEqual(argv, [player, "-ss", "12", "v.mp4", "--end=12"])
+
+    def test_none_or_empty_template_falls_back_to_path_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            self.assertEqual(
+                build_footage_command(player, None, "v.mp4", 50.0), [player, "v.mp4"]
+            )
+            self.assertEqual(
+                build_footage_command(player, [], "v.mp4", 50.0), [player, "v.mp4"]
+            )
+
+    def test_unusable_players_raise_value_error(self):
+        with self.assertRaises(ValueError):
+            build_footage_command(None, None, "v.mp4", 1.0)
+        with self.assertRaises(ValueError):
+            build_footage_command("   ", None, "v.mp4", 1.0)
+        with self.assertRaisesRegex(ValueError, "not found"):
+            build_footage_command("X:/definitely-gone.exe", None, "v.mp4", 1.0)
+        with tempfile.TemporaryDirectory() as folder:
+            player = self._player_file(folder)
+            with self.assertRaises(ValueError):
+                build_footage_command(player, [12], "v.mp4", 1.0)
+
+
+class SanitizePlaybackSettingsTests(unittest.TestCase):
+    """playback_settings from keybinds.json: defensive defaults."""
+
+    def test_missing_or_malformed_degrades_to_auto_detect(self):
+        default = {"player_path": "", "player_args": None}
+        for raw in (None, "junk", 42, [], {}, {"player_path": "   "}, {"player_args": "--start"}):
+            self.assertEqual(sanitize_playback_settings(raw), default)
+
+    def test_valid_settings_round_trip(self):
+        settings = sanitize_playback_settings(
+            {"player_path": "C:/tools/mpv.exe", "player_args": ["--start={start}", "{path}"]}
+        )
+        self.assertEqual(
+            settings, {"player_path": "C:/tools/mpv.exe", "player_args": ["--start={start}", "{path}"]}
+        )
+
+    def test_args_templates_reject_non_string_items(self):
+        for args in ([], [12], ["", "x"], {"k": 1}):
+            settings = sanitize_playback_settings(
+                {"player_path": "C:/tools/mpv.exe", "player_args": args}
+            )
+            self.assertIsNone(settings["player_args"])
 
 
 class ScreenshotSupportTests(unittest.TestCase):
@@ -1088,11 +1574,11 @@ class TranscriptTests(unittest.TestCase):
                 json.dump(legacy, handle)
             restored = TimestampSession(folder)
             self.assertIsNone(restored.entries[0].transcript)
-            # First save should migrate to v6
+            # First save should migrate to the current format
             restored.save()
             with open(os.path.join(folder, "session.json"), encoding="utf-8") as handle:
                 data = json.load(handle)
-            self.assertEqual(data["version"], 6)
+            self.assertEqual(data["version"], 7)
             self.assertIsNone(data["entries"][0]["transcript"])
 
     def test_markdown_embeds_transcript_block(self):
