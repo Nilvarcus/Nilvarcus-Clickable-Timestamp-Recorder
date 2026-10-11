@@ -139,6 +139,12 @@ FOLDER_LABEL_MAX_CHARS = 40
 ROW_TAG_CHIPS = 3
 ROW_LABEL_MAX_CHARS = 34
 
+# Mouse-wheel scroll granularity for the timestamp list, in pixels per
+# yscrollincrement unit. CTk's Windows wheel handler scrolls int(delta/6)
+# units per event (a ±120 notch → 20 units), so the pixel step is this
+# constant × 20: 4 → ~80 px ≈ 2.5 rows per notch instead of CTk's 1 px.
+WHEEL_STEP_PX = 4
+
 # Recent-projects rows show "<name> · N timestamps · M recordings"; long
 # names get middle-elided so the counts stay visible.
 RECENT_ROW_NAME_MAX_CHARS = 36
@@ -236,7 +242,7 @@ class TimestampApp:
         # interaction).
         self._list_rows: dict[int, dict] = {}
         self._header_widgets: dict[object, dict] = {}
-        self._footer_labels: dict[object, ctk.CTkLabel] = {}
+        self._footer_labels: dict[object, dict] = {}
         self._empty_label: ctk.CTkLabel | None = None
         self._list_rows_session: TimestampSession | None = None
         self._list_refresh_job: str | None = None
@@ -641,6 +647,17 @@ class TimestampApp:
         )
         self.timestamp_list.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
         self.timestamp_list.grid_columnconfigure(0, weight=1)
+        # Wider wheel step: CTk scrolls delta/6 "units" of yscrollincrement
+        # px per wheel event, and its Windows default increments 1 px — about
+        # 20 px (a fraction of a row) per notch, which makes long lists crawl.
+        # 4 px units → ~80 px ≈ 2.5 rows per notch (trackpad deltas stay
+        # smooth: tiny deltas already round to whole units either way).
+        canvas = self._timestamp_list_canvas()
+        if canvas is not None:
+            try:
+                canvas.configure(yscrollincrement=WHEEL_STEP_PX)
+            except tk.TclError:
+                pass
 
     def _create_footer(self) -> None:
         footer = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -2065,18 +2082,41 @@ class TimestampApp:
         except tk.TclError:
             return True
 
-    def _scroll_timestamp_list_to_bottom(self) -> None:
+    def _scroll_timestamp_list_to_bottom(self, force: bool = False) -> None:
         """Scroll the timestamp list to its newest entry once layout settles.
 
-        No ``update_idletasks()`` here: forcing a full layout pass over every
-        widget made adding a row to a long list feel heavy. Tk runs the
-        geometry idle handlers (registered by the fresh ``grid()`` calls)
-        before this ``after_idle`` callback, so the scrollregion is already
-        up to date; a second chained idle pass retries in case layout
-        landed later than expected.
+        ``force=True`` marks the project-open path (the only setter of
+        ``_scroll_to_bottom_on_next_refresh``), where hundreds of fresh rows
+        settle in several layout waves. ``CTkScrollableFrame`` recomputes its
+        canvas ``scrollregion`` only from the inner frame's ``<Configure>``
+        window event, which is delivered *after* the idle callbacks that do
+        the actual layout — so an ``after_idle`` moveto(1.0) can compute
+        against a stale region and park the viewport past the end of the
+        (new, taller or shorter) content, leaving the list looking blank
+        until a manual scroll recomputes against the settled region.
+        Therefore the forced path first runs ``update_idletasks()`` once and
+        resyncs the scrollregion from the laid-out geometry before moving:
+        one synchronous full layout pass per project open is cheap and rare,
+        unlike the per-row refresh paths where it stays forbidden.
+
+        With ``force=False`` (single new rows) no ``update_idletasks()``:
+        TK runs the geometry idle handlers (registered by the fresh
+        ``grid()`` calls) before the ``after_idle`` callback, so the
+        scrollregion is nearly up to date; the second chained idle pass
+        retries in case layout landed later than expected.
         """
         if self._closing:
             return
+
+        if force:
+            canvas = self._timestamp_list_canvas()
+            if canvas is not None:
+                try:
+                    self.timestamp_list.update_idletasks()
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+                    canvas.yview_moveto(1.0)
+                except tk.TclError:
+                    pass
 
         def _scroll() -> None:
             canvas = self._timestamp_list_canvas()
@@ -2253,7 +2293,7 @@ class TimestampApp:
                 )
                 if widgets["rendered"] != rendered:
                     widgets["label"].configure(
-                        text=rendered[0], text_color=rendered[1]
+                        text=rendered[0], fg=rendered[1]
                     )
                     widgets["rendered"] = rendered
                 open_button = widgets["open_button"]
@@ -2275,10 +2315,13 @@ class TimestampApp:
                 footer = self._footer_labels.get(key)
                 if footer is None:
                     footer = {
-                        "label": ctk.CTkLabel(
+                        "label": tk.Label(
                             self.timestamp_list,
                             font=Theme.FONT_SMALL,
                             anchor="w",
+                            bg=Theme.BG_ENTRY,
+                            fg=Theme.TEXT_DIM,
+                            takefocus=0,
                         ),
                         "rendered": None,
                         "grid_row": None,
@@ -2294,7 +2337,7 @@ class TimestampApp:
                 )
                 label = footer["label"]
                 if footer["rendered"] != text:
-                    label.configure(text=text, text_color=Theme.TEXT_DIM)
+                    label.configure(text=text, fg=Theme.TEXT_DIM)
                     footer["rendered"] = text
                 if footer["grid_row"] != grid_row:
                     label.grid(row=grid_row, column=0, padx=26, pady=(0, 6), sticky="w")
@@ -2335,7 +2378,9 @@ class TimestampApp:
             self._footer_labels.pop(key)["label"].destroy()
 
         if added_row and follow:
-            self._scroll_timestamp_list_to_bottom()
+            # force only on the project-open path, where the layout must be
+            # settled synchronously before measuring the scroll region.
+            self._scroll_timestamp_list_to_bottom(force=force_scroll)
 
     def _drop_all_rows_and_headers(self) -> None:
         """Destroy every cached row/header/footer widget (not the empty label)."""
@@ -2349,6 +2394,50 @@ class TimestampApp:
             footer["label"].destroy()
         self._footer_labels.clear()
 
+    @staticmethod
+    def _flat_icon_button(
+        master,
+        glyph: str,
+        hover_color: str,
+        command,
+        state: str = "normal",
+    ) -> tk.Button:
+        """Flat one-window stand-in for a small list icon button.
+
+        List rows deliberately avoid CTk widgets: every CTk widget is a Frame
+        plus an internal Canvas (two OS windows with rounded-rect GDI drawing
+        that repaints on hover), which makes long lists heavy on Windows. A
+        flat tk.Button is a single window with no canvas. Hover shows via
+        ``activebackground``, disabled controls dim via ``disabledforeground``
+        and, like CTk's canvas buttons, never take keyboard focus. The dark
+        palette is static (the app locks Dark mode), so hard-coded colors are
+        safe. Square corners are the accepted visual trade-off.
+
+        Size comes from the glyph plus small padx/pady instead of explicit
+        width/height: those tk options are font-dependent (average character
+        widths / text lines), not CTk-style pixels, and inflate the buttons
+        to hundreds of px per row.
+        """
+        return tk.Button(
+            master,
+            text=glyph,
+            font=Theme.FONT_SMALL,
+            padx=3,
+            pady=1,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            bg=Theme.BTN_SURFACE,
+            fg=Theme.TEXT_BRIGHT,
+            activebackground=hover_color,
+            activeforeground=Theme.TEXT_BRIGHT,
+            disabledforeground=Theme.TEXT_DIM,
+            cursor="hand2",
+            state=state,
+            command=command,
+            takefocus=0,
+        )
+
     def _create_row_widgets(self, entry: TimestampEntry) -> dict:
         """Build the widget tree for one compact timestamp row (once per entry).
 
@@ -2358,54 +2447,71 @@ class TimestampApp:
         record/stop/play state machine the old full-width button used; only
         the icon buttons are separate click targets. Everything state-
         dependent is applied by ``_update_row_widgets``.
+
+        All widgets are plain tk widgets (see ``_flat_icon_button`` for why);
+        the shared background is the list's BG_ENTRY because the old CTk
+        containers were transparent against exactly that color.
         """
         assert self.session is not None
         entry_id = entry.id
-        row_frame = ctk.CTkFrame(
-            self.timestamp_list, fg_color="transparent", corner_radius=6
+        row_frame = tk.Frame(
+            self.timestamp_list,
+            bg=Theme.BG_ENTRY,
+            bd=0,
+            highlightthickness=0,
         )
         row_frame.grid_columnconfigure(2, weight=1)
 
-        dot = ctk.CTkLabel(
-            row_frame, text="●", width=16, font=Theme.FONT_SMALL, anchor="e"
+        dot = tk.Label(
+            row_frame,
+            text="●",
+            font=Theme.FONT_SMALL,
+            anchor="e",
+            bg=Theme.BG_ENTRY,
+            fg=Theme.TEXT_DIM,
+            takefocus=0,
         )
         dot.grid(row=0, column=0, padx=(8, 3), pady=4, sticky="ns")
 
-        main_label = ctk.CTkLabel(row_frame, text="", font=Theme.FONT_ROW, anchor="w")
+        main_label = tk.Label(
+            row_frame,
+            text="",
+            font=Theme.FONT_ROW,
+            anchor="w",
+            bg=Theme.BG_ENTRY,
+            fg=Theme.TEXT_DIM,
+            takefocus=0,
+        )
         main_label.grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
 
-        meta_frame = ctk.CTkFrame(row_frame, fg_color="transparent", height=0)
+        meta_frame = tk.Frame(
+            row_frame, bg=Theme.BG_ENTRY, bd=0, highlightthickness=0, height=0
+        )
         meta_frame.grid(row=0, column=2, padx=0, pady=4, sticky="ew")
 
-        actions = ctk.CTkFrame(row_frame, fg_color="transparent")
+        actions = tk.Frame(
+            row_frame, bg=Theme.BG_ENTRY, bd=0, highlightthickness=0
+        )
         actions.grid(row=0, column=3, padx=(2, 6), pady=3, sticky="e")
         next_action_column = 0
         shot_button = None
         take_button = None
         if entry.kind == "replay" and entry.replay_file:
-            ctk.CTkButton(
+            self._flat_icon_button(
                 actions,
-                text="🎬",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.VIOLET_HOVER,
-                command=lambda entry_id=entry_id: self._open_replay_video(entry_id),
+                "🎬",
+                Theme.VIOLET_HOVER,
+                lambda entry_id=entry_id: self._open_replay_video(entry_id),
             ).grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
             # Replays get the same quick-take control as timestamps so a
             # clip can be (re-)recorded without opening the edit dialog.
             # Visibility and look are driven by _update_row_widgets.
-            take_button = ctk.CTkButton(
+            take_button = self._flat_icon_button(
                 actions,
-                text="🎙",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.BTN_SURFACE_HOVER,
-                command=lambda entry_id=entry_id: self._quick_take(entry_id),
+                "🎙",
+                Theme.BTN_SURFACE_HOVER,
+                lambda entry_id=entry_id: self._quick_take(entry_id),
             )
             take_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
@@ -2413,15 +2519,11 @@ class TimestampApp:
             # Timestamps get a 📷 opener for their context screenshot. The
             # JPEG attaches asynchronously, so the button starts disabled and
             # is enabled by _update_row_widgets once screenshot_file lands.
-            shot_button = ctk.CTkButton(
+            shot_button = self._flat_icon_button(
                 actions,
-                text="📷",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.BLUE_HOVER,
-                command=lambda entry_id=entry_id: self._open_screenshot(entry_id),
+                "📷",
+                Theme.BLUE_HOVER,
+                lambda entry_id=entry_id: self._open_screenshot(entry_id),
                 state="normal" if entry.screenshot_file else "disabled",
             )
             shot_button.grid(row=0, column=next_action_column, padx=(0, 2))
@@ -2429,37 +2531,25 @@ class TimestampApp:
             # Quick "record another take" for completed entries. Visibility
             # and look are driven by _update_row_widgets: hidden while
             # pending/error, ■ Stop while this row captures.
-            take_button = ctk.CTkButton(
+            take_button = self._flat_icon_button(
                 actions,
-                text="🎙",
-                width=26,
-                height=22,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.BTN_SURFACE_HOVER,
-                command=lambda entry_id=entry_id: self._quick_take(entry_id),
+                "🎙",
+                Theme.BTN_SURFACE_HOVER,
+                lambda entry_id=entry_id: self._quick_take(entry_id),
             )
             take_button.grid(row=0, column=next_action_column, padx=(0, 2))
             next_action_column += 1
-        ctk.CTkButton(
+        self._flat_icon_button(
             actions,
-            text="✎",
-            width=26,
-            height=22,
-            font=Theme.FONT_SMALL,
-            fg_color=Theme.BTN_SURFACE,
-            hover_color=Theme.BTN_SURFACE_HOVER,
-            command=lambda entry_id=entry_id: self._open_edit_dialog(entry_id),
+            "✎",
+            Theme.BTN_SURFACE_HOVER,
+            lambda entry_id=entry_id: self._open_edit_dialog(entry_id),
         ).grid(row=0, column=next_action_column, padx=(0, 2))
-        ctk.CTkButton(
+        self._flat_icon_button(
             actions,
-            text="✕",
-            width=26,
-            height=22,
-            font=Theme.FONT_SMALL,
-            fg_color=Theme.BTN_SURFACE,
-            hover_color=Theme.RED_HOVER,
-            command=lambda entry_id=entry_id: self._delete_timestamp(entry_id),
+            "✕",
+            Theme.RED_HOVER,
+            lambda entry_id=entry_id: self._delete_timestamp(entry_id),
         ).grid(row=0, column=next_action_column + 1)
 
         # Whole-row click target: forward clicks on passive children too.
@@ -2487,24 +2577,28 @@ class TimestampApp:
         OBS recording video; it starts disabled and stays greyed until the
         session knows the file path (segments from the in-app timer toggle
         or older sessions never get one). The "Earlier timestamps" header
-        passes ``None`` and renders label-only.
+        passes ``None`` and renders label-only. Plain tk widgets, like rows
+        (see ``_flat_icon_button``).
         """
-        frame = ctk.CTkFrame(self.timestamp_list, fg_color="transparent")
-        label = ctk.CTkLabel(frame, font=Theme.FONT_SMALL, anchor="w")
+        frame = tk.Frame(
+            self.timestamp_list, bg=Theme.BG_ENTRY, bd=0, highlightthickness=0
+        )
+        label = tk.Label(
+            frame,
+            font=Theme.FONT_SMALL,
+            anchor="w",
+            bg=Theme.BG_ENTRY,
+            fg=Theme.TEXT_DIM,
+            takefocus=0,
+        )
         label.grid(row=0, column=0, padx=12, pady=(8, 1), sticky="w")
         open_button = None
         if recording is not None:
-            open_button = ctk.CTkButton(
+            open_button = self._flat_icon_button(
                 frame,
-                text="📼",
-                width=26,
-                height=20,
-                font=Theme.FONT_SMALL,
-                fg_color=Theme.BTN_SURFACE,
-                hover_color=Theme.GREEN_HOVER,
-                command=lambda number=recording.number: self._open_recording_video(
-                    number
-                ),
+                "📼",
+                Theme.GREEN_HOVER,
+                lambda number=recording.number: self._open_recording_video(number),
                 state="normal" if recording.path else "disabled",
             )
             open_button.grid(row=0, column=1, padx=(6, 0), pady=(8, 1), sticky="w")
@@ -2527,9 +2621,8 @@ class TimestampApp:
 
         A full-signature skip guards everything below: entries are immutable
         between user actions, so a steady-state refresh (no entry changed)
-        performs no ``configure`` calls at all — canvas-backed CTk widgets
-        redraw on every configure, which used to make long lists repaint
-        themselves wholesale on each refresh.
+        performs no ``configure`` calls at all — keeping long-list refreshes
+        near zero-cost even though tkinter work still happens per refresh.
         """
         assert self.session is not None
         is_playing = bool(
@@ -2555,9 +2648,9 @@ class TimestampApp:
         widgets["signature"] = signature
 
         dot_color, text_color = self._entry_state_colors(entry, is_playing)
-        widgets["dot"].configure(text_color=dot_color)
+        widgets["dot"].configure(fg=dot_color)
         widgets["label"].configure(
-            text=self._entry_label(entry, is_playing), text_color=text_color
+            text=self._entry_label(entry, is_playing), fg=text_color
         )
         shot_button = widgets["shot_button"]
         if shot_button is not None:
@@ -2575,16 +2668,16 @@ class TimestampApp:
                 take_button.grid()
                 take_button.configure(
                     text="■ Stop",
-                    fg_color=Theme.RED,
-                    hover_color=Theme.RED_HOVER,
+                    bg=Theme.RED,
+                    activebackground=Theme.RED_HOVER,
                     state="normal",
                 )
             elif entry.status == "completed":
                 take_button.grid()
                 take_button.configure(
                     text="🎙",
-                    fg_color=Theme.BTN_SURFACE,
-                    hover_color=Theme.BTN_SURFACE_HOVER,
+                    bg=Theme.BTN_SURFACE,
+                    activebackground=Theme.BTN_SURFACE_HOVER,
                     state="normal",
                 )
             else:
@@ -2595,64 +2688,71 @@ class TimestampApp:
             self._rebuild_meta_chips(widgets["meta_frame"], entry)
             widgets["meta_signature"] = meta_signature
 
-    def _rebuild_meta_chips(self, meta_frame: ctk.CTkFrame, entry: TimestampEntry) -> None:
+    def _rebuild_meta_chips(self, meta_frame: tk.Frame, entry: TimestampEntry) -> None:
         """Recreate the inline label/tag chips inside an existing frame.
 
         Shows up to ``ROW_TAG_CHIPS`` tag chips plus a "+N” overflow chip so
         a heavily tagged entry can never push the action icons off-row.
-        Chips forward clicks to the row's record/stop/play handler.
+        Chips forward clicks to the row's record/stop/play handler. Plain
+        tk.Label chips: tag-colored backgrounds keep the accent, minus the
+        rounded corners (accepted trade-off of the flat-row diet).
         """
         for child in meta_frame.winfo_children():
             child.destroy()
         row_click = lambda _event=None, eid=entry.id: self._click_timestamp(eid)
 
-        def add_chip(widget: ctk.CTkLabel) -> None:
+        def add_chip(widget: tk.Label) -> None:
             widget.bind("<Button-1>", row_click)
             widget.configure(cursor="hand2")
 
         next_column = 0
         if entry.label:
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=elide_middle(f'“{entry.label}”', ROW_LABEL_MAX_CHARS),
                 font=Theme.FONT_SMALL,
-                text_color=Theme.TEXT_BRIGHT,
+                fg=Theme.TEXT_BRIGHT,
+                bg=Theme.BG_ENTRY,
                 anchor="w",
+                takefocus=0,
             )
             chip.grid(row=0, column=next_column, padx=(0, 6), sticky="w")
             add_chip(chip)
             next_column += 1
         visible_tags = entry.tags[:ROW_TAG_CHIPS]
         for tag_index, tag_name in enumerate(visible_tags):
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=f" {tag_name} ",
                 font=Theme.FONT_SMALL,
-                fg_color=self._tag_color(tag_name),
-                text_color=Theme.TEXT_BRIGHT,
-                corner_radius=5,
-                height=16,
+                bg=self._tag_color(tag_name),
+                fg=Theme.TEXT_BRIGHT,
+                takefocus=0,
             )
             chip.grid(row=0, column=next_column + tag_index, padx=(0, 4), sticky="w")
             add_chip(chip)
         hidden_tags = len(entry.tags) - len(visible_tags)
         if hidden_tags > 0:
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=f"+{hidden_tags}",
                 font=Theme.FONT_SMALL,
-                text_color=Theme.TEXT_DIM,
+                fg=Theme.TEXT_DIM,
+                bg=Theme.BG_ENTRY,
+                takefocus=0,
             )
             chip.grid(
                 row=0, column=next_column + len(visible_tags), padx=(0, 4), sticky="w"
             )
             add_chip(chip)
         if len(entry.takes) > 1:
-            chip = ctk.CTkLabel(
+            chip = tk.Label(
                 meta_frame,
                 text=f"🎙 {len(entry.takes)} takes",
                 font=Theme.FONT_SMALL,
-                text_color=Theme.TEXT_DIM,
+                fg=Theme.TEXT_DIM,
+                bg=Theme.BG_ENTRY,
+                takefocus=0,
             )
             chip.grid(
                 row=0,
